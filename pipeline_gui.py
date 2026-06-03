@@ -23,6 +23,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 import math
+import re
 import time
 
 MSG_LOG    = "log"
@@ -57,6 +58,32 @@ class QueueStream(io.TextIOBase):
 # Fonctions de pipeline — executees dans un processus separe (mp.Process)
 # =========================================================================
 
+def _sanitize_mol_name(name: str) -> str:
+    """Élimine les caractères qui permettraient une traversée de chemin."""
+    sanitized = re.sub(r'[<>:"/\\|?*\x00]', '_', name)
+    sanitized = re.sub(r'\.{2,}', '.', sanitized)
+    sanitized = sanitized.strip('. ')
+    if not sanitized:
+        raise ValueError(f"Nom de molécule invalide après assainissement : '{name}'")
+    return sanitized
+
+
+def _safe_script_path(path: Path, script_dir: str) -> Path:
+    """Empêche le chargement de modules hors du répertoire de l'application."""
+    allowed = Path(script_dir).resolve()
+    resolved = path.resolve()
+    if resolved.suffix != ".py":
+        raise ValueError(f"Le chemin de module doit être un fichier .py : {path}")
+    try:
+        resolved.relative_to(allowed)
+    except ValueError:
+        raise ValueError(
+            f"Chargement refusé : '{resolved}' est hors du répertoire "
+            f"'{allowed}'."
+        )
+    return resolved
+
+
 def _load_batch_file(filepath: str):
     """Charge un CSV ou Excel. Retourne [(name, smiles, xyz_path), ...]."""
     filepath = filepath.strip()
@@ -80,7 +107,7 @@ def _load_batch_file(filepath: str):
                     header_skipped = True
                 if row[0] is None or row[1] is None:
                     continue
-                name = str(row[0]).strip()
+                name = _sanitize_mol_name(str(row[0]).strip())
                 smiles = str(row[1]).strip()
                 xyz = str(row[2]).strip() if len(row) > 2 and row[2] else ""
                 if name and smiles:
@@ -111,7 +138,7 @@ def _load_batch_file(filepath: str):
                         header_skipped = True
                         continue
                     header_skipped = True
-                name = row[0].strip()
+                name = _sanitize_mol_name(row[0].strip())
                 smiles = row[1].strip()
                 xyz = row[2].strip() if len(row) > 2 else ""
                 if name and smiles:
@@ -254,8 +281,10 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
 
     try:
         p = params
-        orch_path = Path(p.get("orchestrator_path",
-                               Path(script_dir) / "pipeline_orchestrator.py"))
+        orch_path = _safe_script_path(
+            Path(p.get("orchestrator_path",
+                       Path(script_dir) / "pipeline_orchestrator.py")),
+            script_dir)
         if not orch_path.exists():
             raise FileNotFoundError(f"pipeline_orchestrator.py introuvable : {orch_path}")
 
@@ -282,7 +311,7 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
             _log("info",    f"MODE BATCH — {len(molecules)} molecules")
             _log("section", "━" * 50)
         else:
-            molecules = [(p["name"], p["smiles"], p.get("xyz_file", ""))]
+            molecules = [(_sanitize_mol_name(p["name"]), p["smiles"], p.get("xyz_file", ""))]
 
         steps = p["steps"]
 
@@ -298,8 +327,10 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
             _log("section", "━" * 50)
             _log("info", f"MULTI-RECEPTEUR — {len(receptor_files)} récepteurs")
             _log("info", "Calcul de la boîte unifiée...")
-            dock_path = Path(p.get("docking_file") or
-                             str(Path(script_dir) / "docking_kd_pipeline.py"))
+            dock_path = _safe_script_path(
+                Path(p.get("docking_file") or
+                     str(Path(script_dir) / "docking_kd_pipeline.py")),
+                script_dir)
             spec_dock = importlib.util.spec_from_file_location(
                 "docking_kd_pipeline", dock_path)
             dock_mod = importlib.util.module_from_spec(spec_dock)
