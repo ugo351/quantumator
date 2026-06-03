@@ -26,6 +26,7 @@ Utilisation programmatique :
 """
 
 import os
+import re
 import sys
 import json
 import argparse
@@ -41,21 +42,72 @@ import psi4
 # Import dynamique des trois modules
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_module(module_name: str, file_path: str):
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    if spec is None:
-        raise ImportError(f"Impossible de trouver le module : {file_path}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
 _DEFAULT_DIR = Path(__file__).parent
 
 _PSI4_CALC_FILE  = _DEFAULT_DIR / "psi4_calculator_fixed_y.py"
 _ELEC_DENS_FILE  = _DEFAULT_DIR / "electron_density_analysis_fixed.py"
 _DOCKING_FILE    = _DEFAULT_DIR / "docking_kd_pipeline.py"
+
+
+def _validate_module_path(file_path: str) -> str:
+    """Restreint les imports dynamiques aux fichiers dans le répertoire de l'application."""
+    resolved = Path(file_path).resolve()
+    allowed = _DEFAULT_DIR.resolve()
+    if resolved.suffix != ".py":
+        raise ValueError(f"Le chemin de module doit être un fichier .py : {file_path}")
+    try:
+        resolved.relative_to(allowed)
+    except ValueError:
+        raise ValueError(
+            f"Chargement refusé : '{resolved}' est hors du répertoire "
+            f"de l'application '{allowed}'."
+        )
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Module introuvable : {resolved}")
+    return str(resolved)
+
+
+def _sanitize_mol_name(name: str) -> str:
+    """Élimine les caractères qui permettraient une traversée de chemin."""
+    sanitized = re.sub(r'[<>:"/\\|?*\x00]', '_', name)
+    sanitized = re.sub(r'\.{2,}', '.', sanitized)
+    sanitized = sanitized.strip('. ')
+    if not sanitized:
+        raise ValueError(f"Nom de molécule invalide après assainissement : '{name}'")
+    return sanitized
+
+
+def _validate_vina_exe(exe: str) -> str:
+    """Accepte un nom nu (trouvé via PATH) ou un chemin dans le répertoire de l'application."""
+    p = Path(exe)
+    # Nom sans composante de répertoire → trouvé via PATH système
+    if p.parent == Path('.'):
+        return exe
+    # Chemin fourni : doit être dans le répertoire de l'application
+    resolved = p.resolve()
+    allowed = _DEFAULT_DIR.resolve()
+    try:
+        resolved.relative_to(allowed)
+    except ValueError:
+        raise ValueError(
+            f"vina_exe '{exe}' est hors du répertoire de l'application "
+            f"'{allowed}'. Utilisez un nom nu (ex: 'vina') ou un chemin "
+            f"dans le répertoire de l'application."
+        )
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Exécutable Vina introuvable : {resolved}")
+    return str(resolved)
+
+
+def _load_module(module_name: str, file_path: str):
+    safe_path = _validate_module_path(file_path)
+    spec = importlib.util.spec_from_file_location(module_name, safe_path)
+    if spec is None:
+        raise ImportError(f"Impossible de trouver le module : {safe_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -95,7 +147,7 @@ class PipelineConfig:
         docking_file: Optional[str] = None,
     ):
         self.smiles = smiles
-        self.name = name
+        self.name = _sanitize_mol_name(name)
         self.output_dir = Path(output_dir)
         self.dft_functional = dft_functional
         self.dft_basis = dft_basis
@@ -113,7 +165,7 @@ class PipelineConfig:
         self.run_docking = run_docking
         self.peptide_mol_file = peptide_mol_file
         self.box_override = box_override
-        self.vina_exe = vina_exe
+        self.vina_exe = _validate_vina_exe(vina_exe)
         self.vina_exhaustiveness = vina_exhaustiveness
         self.vina_n_poses = vina_n_poses
         self.vina_scoring = vina_scoring
