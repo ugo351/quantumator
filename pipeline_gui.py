@@ -23,7 +23,6 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 import math
-import re
 import time
 
 MSG_LOG    = "log"
@@ -58,14 +57,7 @@ class QueueStream(io.TextIOBase):
 # Fonctions de pipeline — executees dans un processus separe (mp.Process)
 # =========================================================================
 
-def _sanitize_mol_name(name: str) -> str:
-    """Élimine les caractères qui permettraient une traversée de chemin."""
-    sanitized = re.sub(r'[<>:"/\\|?*\x00]', '_', name)
-    sanitized = re.sub(r'\.{2,}', '.', sanitized)
-    sanitized = sanitized.strip('. ')
-    if not sanitized:
-        raise ValueError(f"Nom de molécule invalide après assainissement : '{name}'")
-    return sanitized
+from utils_paths import _sanitize_mol_name
 
 
 def _safe_script_path(path: Path, script_dir: str) -> Path:
@@ -81,6 +73,8 @@ def _safe_script_path(path: Path, script_dir: str) -> Path:
             f"Chargement refusé : '{resolved}' est hors du répertoire "
             f"'{allowed}'."
         )
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Module introuvable : {resolved}")
     return resolved
 
 

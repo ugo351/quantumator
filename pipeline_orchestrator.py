@@ -26,7 +26,6 @@ Utilisation programmatique :
 """
 
 import os
-import re
 import sys
 import json
 import argparse
@@ -67,33 +66,32 @@ def _validate_module_path(file_path: str) -> str:
     return str(resolved)
 
 
-def _sanitize_mol_name(name: str) -> str:
-    """Élimine les caractères qui permettraient une traversée de chemin."""
-    sanitized = re.sub(r'[<>:"/\\|?*\x00]', '_', name)
-    sanitized = re.sub(r'\.{2,}', '.', sanitized)
-    sanitized = sanitized.strip('. ')
-    if not sanitized:
-        raise ValueError(f"Nom de molécule invalide après assainissement : '{name}'")
-    return sanitized
+from utils_paths import _sanitize_mol_name
 
 
 def _validate_vina_exe(exe: str) -> str:
-    """Accepte un nom nu (trouvé via PATH) ou un chemin dans le répertoire de l'application."""
+    """Valide le chemin de l'exécutable Vina.
+
+    Accepte :
+    - Un nom nu sans composante de répertoire (ex: 'vina') → résolu via PATH.
+    - Un chemin absolu vers un fichier existant (ex: sélectionné via file dialog).
+
+    Rejette les chemins relatifs ambigus (ex: '../vina') pour éviter les
+    traversées de répertoire involontaires.
+    """
     p = Path(exe)
-    # Nom sans composante de répertoire → trouvé via PATH système
+    # Nom nu → résolu via PATH système (aucune validation de chemin requise)
     if p.parent == Path('.'):
         return exe
-    # Chemin fourni : doit être dans le répertoire de l'application
-    resolved = p.resolve()
-    allowed = _DEFAULT_DIR.resolve()
-    try:
-        resolved.relative_to(allowed)
-    except ValueError:
+    # Chemin avec composante de répertoire : doit être absolu et pointer
+    # vers un fichier existant. subprocess.run([...]) sans shell=True est
+    # sûr avec un chemin absolu car il n'y a pas d'interprétation shell.
+    if not p.is_absolute():
         raise ValueError(
-            f"vina_exe '{exe}' est hors du répertoire de l'application "
-            f"'{allowed}'. Utilisez un nom nu (ex: 'vina') ou un chemin "
-            f"dans le répertoire de l'application."
+            f"vina_exe '{exe}' est un chemin relatif. "
+            f"Utilisez un nom nu (ex: 'vina') ou un chemin absolu."
         )
+    resolved = p.resolve()
     if not resolved.is_file():
         raise FileNotFoundError(f"Exécutable Vina introuvable : {resolved}")
     return str(resolved)
