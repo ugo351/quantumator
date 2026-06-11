@@ -404,6 +404,7 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
                     tddft_functional = p.get("tddft_functional") or None,
                     tddft_basis      = p.get("tddft_basis")      or None,
                     tddft_use_tda    = p.get("tddft_use_tda", True),
+                    tddft_n_states   = int(p.get("tddft_n_states", 4) or 4),
                     density_functional = p.get("density_functional", "B3LYP"),
                     density_basis      = p.get("density_basis",      "def2-SVP"),
                 )
@@ -858,7 +859,10 @@ class PipelineGUI(tk.Tk):
         self.e_tddft_basis.pack(side="left", padx=(0, 6))
         self.e_tddft_timeout = ParamEntry(r3, "Timeout", "", 6,
                                           "Minutes, vide = adaptatif")
-        self.e_tddft_timeout.pack(side="left")
+        self.e_tddft_timeout.pack(side="left", padx=(0, 6))
+        self.e_tddft_nstates = ParamEntry(r3, "États", "4", 4,
+                                          "Nombre d'états excités TD-DFT (4 = rapide, 10 = complet)")
+        self.e_tddft_nstates.pack(side="left")
 
         self._sep(f, "Parametres Densite")
         r_dens = tk.Frame(f, bg=COLORS["bg"]); r_dens.pack(fill="x", pady=2)
@@ -1110,6 +1114,7 @@ class PipelineGUI(tk.Tk):
             "tddft_basis":        self.e_tddft_basis.get(),
             "tddft_timeout":      self.e_tddft_timeout.get(),
             "tddft_use_tda":      self.tda_var.get(),
+            "tddft_n_states":     self.e_tddft_nstates.get() or "4",
             "density_functional": self.e_dens_func.get()    or "B3LYP",
             "density_basis":      self.e_dens_basis.get()   or "def2-SVP",
             "peptide_mol":        list(self.lb_receptors.get(0, "end")),

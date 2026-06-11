@@ -1793,7 +1793,7 @@ class Psi4MolecularCalculator:
     
     def calculate_lambda_max(self, smiles: str, name: str, optimize=True, solvent=None, timeout_minutes=None, functional=None,
                              geometry_functional_override=None, geometry_basis_override=None,
-                             mol_psi4=None, tddft_basis=None, use_tda=True) -> Dict:
+                             mol_psi4=None, tddft_basis=None, use_tda=True, n_states=4) -> Dict:
         """
         Calcul simplifié pour lambda max via TD-DFT avec sélection automatique de fonctionnelle
         Inclut le suivi des temps de calcul et la classification par famille.
@@ -1925,8 +1925,9 @@ class Psi4MolecularCalculator:
             # 4. Calcul TD-DFT pour lambda max avec fonctionnelle et base sélectionnées
             print(f"[>] Calcul TD-DFT: {functional}/{optimal_basis}")
             tddft_start_time = time.time()
-            tddft_results = self.calculate_tddft(mol, functional, optimal_basis, 
-                                               solvent=solvent, timeout_minutes=timeout_minutes,
+            tddft_results = self.calculate_tddft(mol, functional, optimal_basis,
+                                               n_states=n_states, solvent=solvent,
+                                               timeout_minutes=timeout_minutes,
                                                use_tda=use_tda)
             tddft_time = time.time() - tddft_start_time
             
