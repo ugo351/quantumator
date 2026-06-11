@@ -128,6 +128,7 @@ class PipelineConfig:
         tddft_functional: Optional[str] = None,
         tddft_basis: Optional[str] = None,
         tddft_use_tda: bool = True,
+        tddft_n_states: int = 4,
         run_density: bool = True,
         density_functional: str = "B3LYP",
         density_basis: str = "def2-SVP",
@@ -157,6 +158,7 @@ class PipelineConfig:
         self.tddft_functional = tddft_functional
         self.tddft_basis = tddft_basis
         self.tddft_use_tda = tddft_use_tda
+        self.tddft_n_states = tddft_n_states
         self.run_density = run_density
         self.density_functional = density_functional
         self.density_basis = density_basis
@@ -424,6 +426,31 @@ class MolecularPipeline:
         dft_mol = self.results.get("dft", {}).get("mol_psi4")
         if dft_mol is not None:
             self._log("Géométrie DFT optimisée réutilisée pour TDDFT")
+        elif self.cfg.xyz_file and self.cfg.xyz_file.exists():
+            # Aucune DFT mais un fichier XYZ a été sélectionné : construire mol_psi4 depuis ce fichier
+            self._log(f"Géométrie chargée depuis le fichier XYZ sélectionné : {self.cfg.xyz_file}")
+            try:
+                xyz_content_bypass = self.cfg.xyz_file.read_text(encoding="utf-8")
+                _lines = [l for l in xyz_content_bypass.strip().splitlines() if l.strip()]
+                _n = int(_lines[0].strip())
+                _geom_lines = []
+                for _line in _lines[2:2 + _n]:
+                    _parts = _line.split()
+                    _sym = _parts[0]
+                    _x, _y, _z = float(_parts[1]), float(_parts[2]), float(_parts[3])
+                    _geom_lines.append(f"  {_sym}  {_x:.8f}  {_y:.8f}  {_z:.8f}")
+                _mol_input = "0 1\n" + "\n".join(_geom_lines) + "\nunits angstrom\nno_reorient\nno_com\nsymmetry c1\n"
+                dft_mol = psi4.geometry(_mol_input)
+                dft_mol.update_geometry()
+                self._log(f"Molécule XYZ chargée : {dft_mol.natom()} atomes")
+                # Copier le XYZ dans le dossier de sortie si pas encore fait
+                if self.xyz_path is None:
+                    import shutil
+                    self.xyz_path = self.cfg.output_dir / f"{self.cfg.name}.xyz"
+                    shutil.copy2(str(self.cfg.xyz_file), str(self.xyz_path))
+            except Exception as _e:
+                self._log(f"AVERT : impossible de charger le fichier XYZ ({_e}) — reconstruction depuis SMILES")
+                dft_mol = None
         else:
             self._log("ATTENTION : pas de géométrie DFT — reconstruction depuis SMILES")
 
@@ -439,6 +466,7 @@ class MolecularPipeline:
             timeout_minutes=self.cfg.tddft_timeout_minutes,
             tddft_basis=self.cfg.tddft_basis or self.cfg.dft_basis,
             use_tda=self.cfg.tddft_use_tda,
+            n_states=self.cfg.tddft_n_states,
         )
         elapsed = time.time() - t0
         tddft_res = {
