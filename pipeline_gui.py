@@ -37,19 +37,36 @@ class QueueStream(io.TextIOBase):
         self._q   = q
         self._tag = tag
         self._buf = ""
+        self._log_paths = []
+
+    def set_log_path(self, path):
+        self.set_log_paths([path] if path else [])
+
+    def set_log_paths(self, paths):
+        self.flush()
+        self._log_paths = list(dict.fromkeys(Path(path) for path in paths if path))
+        for log_path in self._log_paths:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.touch(exist_ok=True)
+
+    def _emit_line(self, line):
+        self._q.put((MSG_LOG, (self._tag, line)))
+        for log_path in self._log_paths:
+            with open(log_path, "a", encoding="utf-8", errors="replace") as log_file:
+                log_file.write(line + "\n")
 
     def write(self, text: str) -> int:
         self._buf += text
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
             if line:
-                self._q.put((MSG_LOG, (self._tag, line)))
+                self._emit_line(line)
         return len(text)
 
     def flush(self):
         # Vider le buffer même sans \n final (dernière ligne Psi4)
         if self._buf.strip():
-            self._q.put((MSG_LOG, (self._tag, self._buf)))
+            self._emit_line(self._buf)
             self._buf = ""
 
 
@@ -57,7 +74,7 @@ class QueueStream(io.TextIOBase):
 # Fonctions de pipeline — executees dans un processus separe (mp.Process)
 # =========================================================================
 
-from utils_paths import _sanitize_mol_name
+from utils_paths import OutputLayout, _sanitize_mol_name
 
 
 def _safe_script_path(path: Path, script_dir: str) -> Path:
@@ -148,17 +165,23 @@ def _load_batch_file(filepath: str):
 def _write_batch_summary(all_results, output_dir, _log):
     """Ecrit un CSV recapitulatif du batch."""
     import csv
-    summary_path = Path(output_dir) / "batch_summary.csv"
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    summary_dir = OutputLayout(output_dir).reports
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = summary_dir / "batch_summary.csv"
     with open(summary_path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["Nom", "Energie_DFT_Ha", "Lambda_max_nm", "Fosc",
                      "dG_kcal_mol", "Kd_M", "Succes_DFT", "Succes_TDDFT",
-                     "Succes_Docking"])
+                     "Succes_Docking", "Succes_xTB", "Energie_xTB_Ha",
+                     "Convergence_xTB", "Dihedre_Cinnamique",
+                     "Planarite_Cinnamique"])
         for name, res in all_results.items():
             dft   = res.get("dft", {})
             tddft = res.get("tddft", {})
             dock  = res.get("docking", {})
+            xtb   = res.get("xtb", {})
+            dihedrals = xtb.get("dihedrals", {})
+            first_dihedral = dihedrals.get("dihedral_1", {})
             w.writerow([
                 name,
                 dft.get("energy_hartree", ""),
@@ -169,14 +192,121 @@ def _write_batch_summary(all_results, output_dir, _log):
                 dft.get("success", ""),
                 tddft.get("success", ""),
                 dock.get("success", ""),
+                xtb.get("success", ""),
+                xtb.get("energy_hartree", ""),
+                xtb.get("converged", ""),
+                first_dihedral.get("dihedral_deg", ""),
+                xtb.get("planarity", ""),
             ])
     _log("info", f"Resume batch sauvegarde : {summary_path}")
+
+
+def _write_receptor_ensemble_summary(receptor_results, output_dir, _log):
+    """Summarize score stability across receptor conformations, not as ΔG_bind."""
+    import csv
+    import statistics
+
+    molecule_names = sorted({
+        molecule_name
+        for _receptor_name, results in receptor_results
+        for molecule_name in results
+    })
+    summaries = {}
+    rows = []
+    for molecule_name in molecule_names:
+        entries = []
+        for receptor_name, receptor_molecules in receptor_results:
+            result = receptor_molecules.get(molecule_name, {})
+            docking = result.get("docking", {})
+            score = docking.get("best_dG_kcalmol")
+            if score is not None:
+                entries.append((receptor_name, float(score), result))
+
+        scores = [entry[1] for entry in entries]
+        pi_receptors = [
+            receptor_name for receptor_name, _score, result in entries
+            if result.get("docking", {}).get("pi_contact_geometry", {})
+            .get("pi_geometry_candidates", 0) > 0
+        ]
+        summary = {
+            "receptor_models": len(receptor_results),
+            "successful_models": len(scores),
+            "best_receptor": min(entries, key=lambda entry: entry[1])[0] if entries else "",
+            "best_dG_kcalmol": min(scores) if scores else None,
+            "mean_best_dG_kcalmol": statistics.fmean(scores) if scores else None,
+            "std_best_dG_kcalmol": statistics.pstdev(scores) if len(scores) > 1 else 0.0 if scores else None,
+            "pi_candidate_receptor_count": len(pi_receptors),
+            "pi_candidate_receptors": ";".join(pi_receptors),
+        }
+        summaries[molecule_name] = summary
+        rows.append([molecule_name, *summary.values()])
+
+    summary_dir = OutputLayout(output_dir).reports
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = summary_dir / "receptor_ensemble_summary.csv"
+    columns = ["Molecule", "Receptor_models", "Successful_models", "Best_receptor",
+               "Best_dG_kcal_mol", "Mean_dG_kcal_mol", "Std_dG_kcal_mol",
+               "Pi_candidate_receptor_count", "Pi_candidate_receptors"]
+    with open(summary_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(columns)
+        writer.writerows(rows)
+    _log("info", f"Resume ensemble recepteur sauvegarde : {summary_path}")
+    return summaries
+
+
+def _parse_dihedrals(text: str):
+    dihedrals = []
+    for line_number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            indices = [int(value) for value in line.replace(",", " ").split()]
+        except ValueError as exc:
+            raise ValueError(f"Ligne de diedre {line_number}: indices entiers requis.") from exc
+        if len(indices) != 4 or any(index < 1 for index in indices):
+            raise ValueError(
+                f"Ligne de diedre {line_number}: entrer exactement 4 indices positifs."
+            )
+        dihedrals.append([index - 1 for index in indices])
+    return dihedrals
+
+
+def _numbered_molecule_image(smiles: str):
+    from rdkit import Chem
+    from rdkit.Chem import AllChem, Draw
+
+    molecule = Chem.MolFromSmiles(smiles)
+    if molecule is None:
+        raise ValueError("SMILES invalide.")
+    AllChem.Compute2DCoords(molecule)
+    atom_count = molecule.GetNumAtoms()
+    width = max(1000, min(1900, atom_count * 20))
+    height = max(680, min(1200, int(width * 0.66)))
+    drawer = Draw.rdMolDraw2D.MolDraw2DCairo(width, height)
+    options = drawer.drawOptions()
+    options.padding = 0.08
+    for atom in molecule.GetAtoms():
+        options.atomLabels[atom.GetIdx()] = f"{atom.GetSymbol()}{atom.GetIdx() + 1}"
+    drawer.DrawMolecule(molecule)
+    drawer.FinishDrawing()
+
+    atom_rows = []
+    for atom in molecule.GetAtoms():
+        neighbors = ", ".join(
+            f"{neighbor.GetIdx() + 1}:{neighbor.GetSymbol()}"
+            for neighbor in atom.GetNeighbors()
+        )
+        atom_rows.append((atom.GetIdx() + 1, atom.GetSymbol(), neighbors))
+    return drawer.GetDrawingText(), width, height, atom_rows
 
 
 def _patch_step_fn(pipe, key, fn, _log, _step):
     """Wrap une etape du pipeline pour le suivi de progression."""
     _labels = {
         "init": "Initialisation",
+        "xtb": "Optimisation xTB",
         "dft": "Optimisation DFT",
         "tddft": "TDDFT UV-Vis",
         "density": "Densite electronique",
@@ -234,11 +364,71 @@ def _log_step_results(key, results, _log):
         _v("best_dG_kcalmol", "{:.2f}")
         _v("best_Kd_M", "{:.2e}")
         _v("n_poses")
+        _v("n_runs")
+        _v("best_seed")
+        _v("mean_best_dG_kcalmol", "{:.2f}")
+        _v("std_best_dG_kcalmol", "{:.2f}")
+        geometry = results.get("pi_contact_geometry", {})
+        if geometry:
+            _log("info", f"    poses analysées = {geometry.get('poses_analyzed')}")
+            _log("info", f"    géométries aromatiques candidates = "
+                          f"{geometry.get('pi_geometry_candidates')}")
+            _log("info", f"    rapport géométrique = {geometry.get('details_csv')}")
+    elif key == "xtb":
+        _v("converged")
+        _v("energy_hartree", "{:.8f}")
+        _v("n_iterations")
+        _v("runtime_s", "{:.1f}")
+        _v("process_logs_dir")
+        if results.get("crest_conformers_xyz"):
+            _log("info", f"    ensemble CREST (XYZ multi-frame) = {results['crest_conformers_xyz']}")
+        if results.get("crest_energy_landscape_csv"):
+            _log("info", f"    paysage energetique = {results['crest_energy_landscape_csv']}")
+        if results.get("crest_energy_scan_csv"):
+            _log("info", f"    scan CREST complet = {results['crest_energy_scan_csv']}")
+        if results.get("crest_search_candidates_xyz"):
+            _log("info", f"    candidats explorés CREST (XYZ) = {results['crest_search_candidates_xyz']}")
+        if results.get("crest_search_scan_csv"):
+            _log("info", f"    énergies des candidats CREST = {results['crest_search_scan_csv']}")
+        if results.get("crest_conformer_landscape_3d_html"):
+            _log("info", f"    paysage 3D CREST interactif = {results['crest_conformer_landscape_3d_html']}")
+        if results.get("crest_dihedral_energy_absolute_html"):
+            _log("info", f"    énergie selon le dièdre absolu = {results['crest_dihedral_energy_absolute_html']}")
+        if results.get("crest_search_energy_distribution_csv"):
+            _log("info", f"    distribution d'energies CREST (CSV) = {results['crest_search_energy_distribution_csv']}")
+        if results.get("crest_refined_xyz_files"):
+            _log("info", f"    conformeres raffines exportes = {len(results['crest_refined_xyz_files'])}")
+        planarity = results.get("dihedrals", {})
+        for name, dihedral in planarity.items():
+            if name.startswith("dihedral_"):
+                _log("info", f"    {name} = {dihedral.get('dihedral_deg', '?'):.1f} deg")
+        if "all_planar" in planarity:
+            _log("info", f"    planarity = {'OUI' if planarity['all_planar'] else 'NON'}")
+        constrained = results.get("constrained", {})
+        if constrained:
+            _log("info", "    optimisation contrainte (séparée):")
+            _log("info", f"      success = {constrained.get('success')}")
+            _log("info", f"      energy_hartree = {constrained.get('energy_hartree')}")
+            _log("info", f"      energy_difference_hartree = "
+                          f"{constrained.get('energy_difference_hartree')}")
+            _log("info", f"      optimized_xyz = {constrained.get('optimized_xyz')}")
     _known = {"success", "error", "energy_hartree", "n_atoms",
               "converged", "n_iterations", "lambda_max_nm",
               "max_oscillator_strength", "n_states", "solvent",
               "cube_file", "density_at_origin", "best_dG_kcalmol",
-              "best_Kd_M", "n_poses"}
+              "best_Kd_M", "n_poses", "n_runs", "best_seed",
+              "mean_best_dG_kcalmol", "std_best_dG_kcalmol",
+              "pi_contact_geometry", "runtime_s", "method", "opt_level",
+              "optimized_xyz", "stdout_tail", "stderr_tail", "dihedrals",
+              "planarity", "returncode", "conformers_refined",
+              "crest_conformers_xyz", "crest_energy_landscape_csv",
+              "crest_energy_scan_csv",
+              "crest_search_candidates_xyz", "crest_search_scan_csv",
+              "crest_conformer_landscape_3d_html",
+              "crest_dihedral_energy_absolute_html",
+              "crest_search_energy_distribution_csv",
+              "crest_conformer_xyz_files", "crest_refined_xyz_files",
+              "crest_stdout_tail", "process_logs_dir", "constrained"}
     extras = [(k, v) for k, v in results.items()
               if k not in _known and not isinstance(v, (dict, list, bytes))]
     for k, v in extras:
@@ -267,14 +457,34 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
     sys.stdout = QueueStream(q, "normal")
     sys.stderr = QueueStream(q, "error")
 
+    active_log: dict[str, Optional[Path]] = {"path": None}
+    batch_log_path = None
+    base_layout = None
+
     def _log(tag, text):
         q.put((MSG_LOG, (tag, text)))
+        log_paths = [batch_log_path, active_log["path"]]
+        for log_path in dict.fromkeys(path for path in log_paths if path is not None):
+            with open(log_path, "a", encoding="utf-8", errors="replace") as log_file:
+                log_file.write(f"[{tag}] {text}\n")
 
     def _step(key, state, detail=""):
         q.put((MSG_STEP, (key, state, detail)))
 
     try:
         p = params
+        base_output = p.get("output_dir", "./pipeline_results")
+        Path(base_output).mkdir(parents=True, exist_ok=True)
+        p["output_dir"] = base_output
+        base_layout = OutputLayout(base_output).create()
+        batch_log_path = base_layout.logs / "pipeline.log"
+        batch_log_path.touch(exist_ok=True)
+        active_log["path"] = batch_log_path
+        if isinstance(sys.stdout, QueueStream):
+            sys.stdout.set_log_paths([batch_log_path])
+        if isinstance(sys.stderr, QueueStream):
+            sys.stderr.set_log_paths([batch_log_path])
+
         orch_path = _safe_script_path(
             Path(p.get("orchestrator_path",
                        Path(script_dir) / "pipeline_orchestrator.py")),
@@ -289,11 +499,6 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
 
         PipelineConfig    = orch.PipelineConfig
         MolecularPipeline = orch.MolecularPipeline
-
-        # --- Dossier de sortie (toujours le même) ---
-        base_output = p.get("output_dir", "./pipeline_results")
-        Path(base_output).mkdir(parents=True, exist_ok=True)
-        p["output_dir"] = base_output
 
         # --- Construire la liste de molecules (mode simple ou batch) ---
         batch_file = p.get("batch_file", "").strip()
@@ -339,6 +544,8 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
 
         t0_global = time.time()
         final_results = {}
+        receptor_results = []
+        molecule_output_dirs = {}
         grand_total = len(receptor_files) * len(molecules)
         global_idx = 0
 
@@ -377,6 +584,13 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
                 # Sous-dossier par molécule (suffixe _2, _3… si le nom existe déjà)
                 out_dir = _unique_dir(str(Path(rec_output) / mol_name))
                 mol_name_actual = Path(out_dir).name
+                molecule_output_dirs[mol_name_actual] = Path(out_dir)
+                mol_layout = OutputLayout(out_dir).create()
+                active_log["path"] = mol_layout.logs / f"{mol_name_actual}_pipeline.log"
+                if isinstance(sys.stdout, QueueStream):
+                    sys.stdout.set_log_paths([batch_log_path, active_log["path"]])
+                if isinstance(sys.stderr, QueueStream):
+                    sys.stderr.set_log_paths([batch_log_path, active_log["path"]])
 
                 _log("info", f"  SMILES        : {mol_smiles}")
                 _log("info", f"  Etapes        : {', '.join(steps)}")
@@ -400,6 +614,37 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
                     run_tddft        = "tddft"   in steps,
                     run_density      = "density" in steps,
                     run_docking      = "docking" in steps,
+                    run_xtb          = "xtb" in steps,
+                    xtb_exe          = p.get("xtb_exe", "xtb"),
+                    xtb_method       = p.get("xtb_method", "GFN2"),
+                    xtb_opt_level    = p.get("xtb_opt_level", "tight"),
+                    xtb_charge       = int(p.get("xtb_charge", 0)),
+                    xtb_multiplicity = int(p.get("xtb_multiplicity", 1)),
+                    xtb_threads      = int(p.get("xtb_threads", 10)),
+                    run_crest        = p.get("run_crest", False),
+                    crest_exe        = p.get("crest_exe", "crest"),
+                    crest_n_conformers = int(p.get("crest_n_conformers", 10)),
+                    crest_use_wsl    = p.get("crest_use_wsl", False),
+                    crest_wsl_exe    = p.get("crest_wsl_exe", "crest"),
+                    crest_wsl_xtb_exe = p.get(
+                        "crest_wsl_xtb_exe",
+                        "/home/ugopasco/miniforge3/envs/crest_xtb/bin/xtb",
+                    ),
+                    xtb_use_optimized_geometry_for_dft = p.get(
+                        "xtb_use_optimized_geometry_for_dft", True),
+                    xtb_use_optimized_geometry_for_docking = p.get(
+                        "xtb_use_optimized_geometry_for_docking", True),
+                    xtb_dihedrals    = p.get("xtb_dihedrals", []),
+                    xtb_planarity_threshold_deg = float(
+                        p.get("xtb_planarity_threshold_deg", 5.0)),
+                    xtb_run_constrained = p.get("xtb_run_constrained", False),
+                    xtb_constraint_target_deg = float(
+                        p.get("xtb_constraint_target_deg", 0.0)),
+                    xtb_constraint_force_constant = float(
+                        p.get("xtb_constraint_force_constant", 0.5)),
+                    xtb_stop_after = p.get("xtb_stop_after", False),
+                    vina_runs       = int(p.get("vina_runs", 3)),
+                    vina_seed       = int(p.get("vina_seed", 42)),
                     tddft_solvent    = p.get("tddft_solvent")    or None,
                     tddft_functional = p.get("tddft_functional") or None,
                     tddft_basis      = p.get("tddft_basis")      or None,
@@ -443,12 +688,12 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
                 _log("success", "✓ Pipeline initialise")
 
                 # Patcher les etapes principales pour suivi detaille
-                for skey in ["dft", "tddft", "density", "docking"]:
+                for skey in ["xtb", "dft", "tddft", "density", "docking"]:
                     if hasattr(pipe, f"_step_{skey}"):
                         _patch_step_fn(pipe, skey, getattr(pipe, f"_step_{skey}"),
                                        _log, _step)
 
-                for skey in ["tddft", "density", "docking"]:
+                for skey in ["xtb", "dft", "tddft", "density", "docking"]:
                     if skey not in steps:
                         _step(skey, "skip")
 
@@ -464,7 +709,7 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
 
                 # Reset indicators pour la prochaine molecule
                 if global_idx < grand_total:
-                    for skey in ["init", "dft", "tddft", "density", "docking"]:
+                    for skey in ["init", "xtb", "dft", "tddft", "density", "docking"]:
                         _step(skey, "pending")
 
             if stop_event.is_set():
@@ -475,6 +720,30 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
                 _write_batch_summary(all_results, rec_output, _log)
 
             final_results = all_results
+            receptor_results.append((receptor_name or f"receptor_{rec_idx}", all_results))
+
+        if "docking" in steps and len(receptor_results) > 1:
+            ensemble_summaries = _write_receptor_ensemble_summary(
+                receptor_results, base_output, _log
+            )
+            for molecule_name, summary in ensemble_summaries.items():
+                if molecule_name in final_results:
+                    final_results[molecule_name]["docking_ensemble"] = summary
+                    _log(
+                        "info",
+                        f"Ensemble {molecule_name}: "
+                        f"{summary['successful_models']}/{summary['receptor_models']} "
+                        f"récepteurs; ΔG moyen = {summary['mean_best_dG_kcalmol']}; "
+                        f"écart-type = {summary['std_best_dG_kcalmol']}; "
+                        f"π-candidats = {summary['pi_candidate_receptor_count']}",
+                    )
+
+        if base_layout is not None:
+            active_log["path"] = base_layout.logs / "pipeline.log"
+            if isinstance(sys.stdout, QueueStream):
+                sys.stdout.set_log_paths([batch_log_path])
+            if isinstance(sys.stderr, QueueStream):
+                sys.stderr.set_log_paths([batch_log_path])
 
         # Résumé global
         elapsed_global = time.time() - t0_global
@@ -489,7 +758,15 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
             try:
                 import shutil
                 src = Path(batch_file)
-                dst = Path(base_output) / src.name
+                if base_layout is not None:
+                    dst_dir = base_layout.reports
+                elif molecule_output_dirs:
+                    last_molecule_dir = next(reversed(molecule_output_dirs.values()))
+                    dst_dir = OutputLayout(last_molecule_dir).reports
+                else:
+                    dst_dir = Path(base_output)
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                dst = dst_dir / src.name
                 if src.exists() and src.resolve() != dst.resolve():
                     shutil.copy2(str(src), str(dst))
                     _log("info", f"Copie du datasheet : {dst}")
@@ -508,6 +785,10 @@ def _run_pipeline(params: dict, q, stop_event, script_dir: str):
             sys.stderr.flush()
         except Exception:
             pass
+        if isinstance(sys.stdout, QueueStream):
+            sys.stdout.set_log_path(None)
+        if isinstance(sys.stderr, QueueStream):
+            sys.stderr.set_log_path(None)
         sys.stdout = old_out
         sys.stderr = old_err
         q.put((MSG_DONE, None))
@@ -714,8 +995,8 @@ class PipelineGUI(tk.Tk):
         super().__init__()
         self.title("Molecular Pipeline — SMILES > DFT > TDDFT > Density > Docking")
         self.configure(bg=COLORS["bg"])
-        self.geometry("1160x860")
-        self.minsize(920, 680)
+        self.geometry("1360x900")
+        self.minsize(1120, 720)
 
         self._queue      = mp.Queue()
         self._stop_event = mp.Event()
@@ -746,7 +1027,7 @@ class PipelineGUI(tk.Tk):
         body = tk.Frame(self, bg=COLORS["bg"])
         body.pack(fill="both", expand=True, padx=20, pady=10)
 
-        left = tk.Frame(body, bg=COLORS["bg"], width=380)
+        left = tk.Frame(body, bg=COLORS["bg"], width=500)
         left.pack(side="left", fill="y", padx=(0, 10))
         left.pack_propagate(False)
         self._build_params(left)
@@ -789,60 +1070,175 @@ class PipelineGUI(tk.Tk):
         sf = tk.Frame(f, bg=COLORS["panel"])
         sf.pack(fill="x", pady=4)
         self._step_vars = {}
+        self._step_checkbuttons = {}
+        self._steps_before_xtb_stop = None
         for key, lbl, default, disabled in [
-            ("dft",     "Optimisation DFT",          True,  True),
+            ("xtb",     "Optimisation xTB",          True,  False),
+            ("dft",     "Optimisation DFT",          True,  False),
             ("tddft",   "TDDFT — lambda max UV-Vis",  False, False),
             ("density", "Densite electronique",       False, False),
             ("docking", "Docking / Kd (Vina)",        False, False),
         ]:
             v = tk.BooleanVar(value=default)
             self._step_vars[key] = v
-            tk.Checkbutton(sf, text=lbl, variable=v, font=FONT_NORMAL,
-                           bg=COLORS["panel"], fg=COLORS["text"],
-                           activebackground=COLORS["panel"],
-                           activeforeground=COLORS["accent"],
-                           selectcolor=COLORS["card"],
-                           state="disabled" if disabled else "normal"
-                           ).pack(anchor="w", pady=1)
-        tk.Label(sf, text="  * DFT toujours en premier", font=FONT_SMALL,
-                 bg=COLORS["panel"], fg=COLORS["text_dim"]).pack(anchor="w")
+            checkbox = tk.Checkbutton(
+                sf, text=lbl, variable=v, font=FONT_NORMAL,
+                bg=COLORS["panel"], fg=COLORS["text"],
+                activebackground=COLORS["panel"],
+                activeforeground=COLORS["accent"],
+                selectcolor=COLORS["card"],
+                state="disabled" if disabled else "normal",
+            )
+            if key == "xtb":
+                checkbox.config(command=self._on_xtb_step_toggle)
+            else:
+                checkbox.config(command=self._on_step_selection_changed)
+            checkbox.pack(anchor="w", pady=1)
+            self._step_checkbuttons[key] = checkbox
 
-        self._sep(f, "Parametres DFT")
-        self.e_xyz = self._file_row(f, "Fichier XYZ (bypass optim. geom.)",
-                                     self._browse_xyz)
-        tk.Label(f, text="  Si renseigne, saute l'optimisation geometrique DFT",
+        self._settings_host = tk.Frame(f, bg=COLORS["bg"])
+        self._settings_host.pack(fill="x")
+        self._step_panels = {}
+
+        def make_panel(key, title):
+            panel = tk.Frame(self._settings_host, bg=COLORS["bg"])
+            self._step_panels[key] = panel
+            self._sep(panel, title)
+            return panel
+
+        geometry_panel = make_panel("geometry", "Structure initiale")
+        self.e_xyz = self._file_row(
+            geometry_panel, "Fichier XYZ d'entrée", self._browse_xyz
+        )
+        tk.Label(geometry_panel, text="  Utilisé comme géométrie de départ.",
                  font=FONT_SMALL, bg=COLORS["bg"],
                  fg=COLORS["text_dim"]).pack(anchor="w")
+
+        xtb_panel = make_panel("xtb", "Paramètres xTB et analyse géométrique")
+        self.e_xtb_exe = self._file_row(
+            xtb_panel, "Executable xtb.exe", self._browse_xtb, default="xtb"
+        )
+        row_xtb = tk.Frame(xtb_panel, bg=COLORS["bg"]); row_xtb.pack(fill="x", pady=2)
+        self.e_xtb_method = ParamEntry(row_xtb, "Methode", "GFN2", 8)
+        self.e_xtb_method.pack(side="left", padx=(0, 6))
+        self.e_xtb_level = ParamEntry(row_xtb, "Optimisation", "tight", 10)
+        self.e_xtb_level.pack(side="left", padx=(0, 6))
+        self.e_xtb_charge = ParamEntry(row_xtb, "Charge", "0", 6)
+        self.e_xtb_charge.pack(side="left", padx=(0, 6))
+        self.e_xtb_mult = ParamEntry(row_xtb, "Multiplicite", "1", 8)
+        self.e_xtb_mult.pack(side="left")
+        self.e_xtb_threads = ParamEntry(xtb_panel, "Threads xTB", "10", 8)
+        self.e_xtb_threads.pack(anchor="w", pady=2)
+        self.crest_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(xtb_panel, text="Recherche de conformeres CREST", variable=self.crest_var,
+                   font=FONT_NORMAL, bg=COLORS["bg"], fg=COLORS["text"],
+                   activebackground=COLORS["bg"], selectcolor=COLORS["card"]
+                   ).pack(anchor="w")
+        self.crest_wsl_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            xtb_panel, text="Lancer CREST via WSL", variable=self.crest_wsl_var,
+            font=FONT_NORMAL, bg=COLORS["bg"], fg=COLORS["text"],
+            activebackground=COLORS["bg"], selectcolor=COLORS["card"],
+        ).pack(anchor="w")
+        self.e_crest_wsl_exe = ParamEntry(
+            xtb_panel, "Executable CREST (chemin Linux)",
+            "/mnt/c/Users/ugo.pasco/bin/crest", width=52,
+        )
+        self.e_crest_wsl_exe.pack(fill="x", pady=2)
+        self.e_crest_wsl_xtb_exe = ParamEntry(
+            xtb_panel, "Executable xTB dans WSL",
+            "/home/ugopasco/miniforge3/envs/crest_xtb/bin/xtb", width=52,
+        )
+        self.e_crest_wsl_xtb_exe.pack(fill="x", pady=2)
+        self.e_crest_exe = self._file_row(xtb_panel, "Executable crest", self._browse_crest,
+                           default="crest")
+        self.e_crest_n = ParamEntry(xtb_panel, "Nombre de conformeres CREST", "10", 8)
+        self.e_crest_n.pack(anchor="w", pady=2)
+        self.xtb_stop_after_var = tk.BooleanVar(value=True)
+        self.xtb_stop_after_check = tk.Checkbutton(
+            xtb_panel,
+            text="Arrêter le pipeline après xTB (ne pas lancer DFT ni les étapes suivantes)",
+            variable=self.xtb_stop_after_var,
+            font=FONT_NORMAL, bg=COLORS["bg"], fg=COLORS["text"],
+            activebackground=COLORS["bg"], selectcolor=COLORS["card"],
+            command=self._on_xtb_stop_after_toggle,
+        )
+        self.xtb_stop_after_check.pack(anchor="w", pady=(4, 0))
+
+        tk.Label(xtb_panel,
+             text="Par défaut, la géométrie xTB est raffinée par DFT.",
+                 font=FONT_SMALL, bg=COLORS["bg"], fg=COLORS["text_dim"]
+                 ).pack(anchor="w", pady=(3, 2))
+        tk.Button(xtb_panel, text="Afficher molecule et indices",
+              font=FONT_NORMAL, bg=COLORS["card"], fg=COLORS["text"],
+              activebackground=COLORS["border"], relief="flat",
+              command=self._show_atom_index_preview
+              ).pack(anchor="w", pady=(2, 5))
+        tk.Label(xtb_panel, text="Indices des dièdres, un par ligne (atomes numerotes a partir de 1)",
+             font=FONT_SMALL, bg=COLORS["bg"], fg=COLORS["text_dim"]
+             ).pack(anchor="w")
+        self.xtb_dihedrals_text = tk.Text(xtb_panel, height=3, width=34, font=FONT_MONO,
+                          bg=COLORS["card"], fg=COLORS["text"],
+                          insertbackground=COLORS["text"], relief="flat")
+        self.xtb_dihedrals_text.pack(fill="x", pady=2)
+        self.xtb_dihedrals_text.insert("1.0", "")
+        self.e_xtb_threshold = ParamEntry(xtb_panel, "Seuil de planarite (degres)", "5.0", 8)
+        self.e_xtb_threshold.pack(anchor="w", pady=2)
+        self.xtb_constrain_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            xtb_panel,
+            text="Tester aussi une optimisation plane contrainte (séparée)",
+            variable=self.xtb_constrain_var,
+            font=FONT_NORMAL, bg=COLORS["bg"], fg=COLORS["text"],
+            activebackground=COLORS["bg"], selectcolor=COLORS["card"],
+        ).pack(anchor="w", pady=(4, 0))
+        row_constraint = tk.Frame(xtb_panel, bg=COLORS["bg"])
+        row_constraint.pack(fill="x", pady=2)
+        self.e_xtb_target = ParamEntry(row_constraint, "Cible (deg)", "0", 8)
+        self.e_xtb_target.pack(side="left", padx=(0, 6))
+        self.e_xtb_force = ParamEntry(row_constraint, "Constante de force", "0.5", 12)
+        self.e_xtb_force.pack(side="left")
+        tk.Label(
+            xtb_panel,
+            text="Le calcul libre reste intact; cibles planes: 0 ou 180 deg.",
+            font=FONT_SMALL, bg=COLORS["bg"], fg=COLORS["text_dim"],
+        ).pack(anchor="w")
+
+        dft_panel = make_panel("dft", "Paramètres DFT")
         self.skip_sp_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(f, text="Skip single-point (bypass sans calcul d'energie)",
+        tk.Checkbutton(dft_panel, text="Skip single-point (bypass sans calcul d'energie)",
                        variable=self.skip_sp_var, font=FONT_NORMAL,
-                       bg=COLORS["bg"], fg=COLORS["text"],
-                       activebackground=COLORS["bg"],
+                   bg=COLORS["bg"], fg=COLORS["text"],
+                   activebackground=COLORS["bg"],
                        activeforeground=COLORS["accent"],
                        selectcolor=COLORS["card"]
                        ).pack(anchor="w", pady=(2, 0))
-        tk.Label(f, text="  Uniquement avec bypass XYZ — saute le calcul single-point Psi4",
+        tk.Label(dft_panel, text="  Option utile avec un XYZ fourni",
                  font=FONT_SMALL, bg=COLORS["bg"],
                  fg=COLORS["text_dim"]).pack(anchor="w")
-        r = tk.Frame(f, bg=COLORS["bg"]); r.pack(fill="x", pady=2)
+        r = tk.Frame(dft_panel, bg=COLORS["bg"]); r.pack(fill="x", pady=2)
         self.e_func  = ParamEntry(r, "Fonctionnelle", "B3LYP",    12,
                                   "Ex: B3LYP, CAM-B3LYP, PBE0")
         self.e_func.pack(side="left", padx=(0, 6))
         self.e_basis = ParamEntry(r, "Base",           "def2-SVP", 12,
                                   "Ex: def2-SVP, def2-TZVP, 6-31G*")
         self.e_basis.pack(side="left")
-        r2 = tk.Frame(f, bg=COLORS["bg"]); r2.pack(fill="x", pady=2)
+        r2 = tk.Frame(dft_panel, bg=COLORS["bg"]); r2.pack(fill="x", pady=2)
         self.e_memory  = ParamEntry(r2, "Memoire Psi4", "12 GB", 10)
         self.e_memory.pack(side="left", padx=(0, 6))
         self.e_threads = ParamEntry(r2, "Threads", "10", 6)
         self.e_threads.pack(side="left")
+        self.e_psi4_file = self._file_row(
+            dft_panel, "Module Psi4",
+            lambda: self._browse_py(self.e_psi4_file),
+        )
 
-        self._sep(f, "Parametres TDDFT")
-        self.e_solvent = ParamEntry(f, "Solvant", default="ACN",
+        tddft_panel = make_panel("tddft", "Paramètres TDDFT UV-Vis")
+        self.e_solvent = ParamEntry(tddft_panel, "Solvant", default="ACN",
                                     tooltip="Ex: ACN, methanol, dmso, thf, cyclohexane — vide=gaz")
         self.e_solvent.pack(fill="x", pady=2)
         # Option TDA (Tamm-Dancoff Approximation) — cochée par défaut (~2x plus rapide)
-        tda_frame = tk.Frame(f, bg=COLORS["bg"]); tda_frame.pack(fill="x", pady=2)
+        tda_frame = tk.Frame(tddft_panel, bg=COLORS["bg"]); tda_frame.pack(fill="x", pady=2)
         self.tda_var = tk.BooleanVar(value=True)
         tk.Checkbutton(tda_frame, text="TDA (Tamm-Dancoff) — plus rapide",
                        variable=self.tda_var, font=FONT_NORMAL,
@@ -850,8 +1246,8 @@ class PipelineGUI(tk.Tk):
                        activebackground=COLORS["bg"],
                        activeforeground=COLORS["accent"],
                        selectcolor=COLORS["card"]).pack(anchor="w")
-        r3 = tk.Frame(f, bg=COLORS["bg"]); r3.pack(fill="x", pady=2)
-        self.e_tddft_func = ParamEntry(r3, "Fonctionnelle", "CAM-B3LYP", 14,
+        r3 = tk.Frame(tddft_panel, bg=COLORS["bg"]); r3.pack(fill="x", pady=2)
+        self.e_tddft_func = ParamEntry(r3, "Fonctionnelle", "B3LYP", 14,
                                        "Vide = meme que DFT")
         self.e_tddft_func.pack(side="left", padx=(0, 6))
         self.e_tddft_basis = ParamEntry(r3, "Base", "", 12,
@@ -864,24 +1260,27 @@ class PipelineGUI(tk.Tk):
                                           "Nombre d'états excités TD-DFT (4 = rapide, 10 = complet)")
         self.e_tddft_nstates.pack(side="left")
 
-        self._sep(f, "Parametres Densite")
-        r_dens = tk.Frame(f, bg=COLORS["bg"]); r_dens.pack(fill="x", pady=2)
+        density_panel = make_panel("density", "Paramètres densité électronique")
+        r_dens = tk.Frame(density_panel, bg=COLORS["bg"]); r_dens.pack(fill="x", pady=2)
         self.e_dens_func = ParamEntry(r_dens, "Fonctionnelle", "B3LYP", 14,
                                       "Fonctionnelle pour calcul SCF densite")
         self.e_dens_func.pack(side="left", padx=(0, 6))
         self.e_dens_basis = ParamEntry(r_dens, "Base", "def2-SVP", 12,
                                        "Base pour calcul SCF densite")
         self.e_dens_basis.pack(side="left")
+        self.e_dens_file = self._file_row(
+            density_panel, "Module analyse densité",
+            lambda: self._browse_py(self.e_dens_file),
+        )
 
-        self._sep(f, "Docking AutoDock Vina")
-        _base_dir = str(Path(__file__).parent)
+        docking_panel = make_panel("docking", "Docking AutoDock Vina")
         _default_vina = str(Path(__file__).parent / "vina_1.2.7_win.exe")
 
         # Multi-récepteur : liste de fichiers
-        tk.Label(f, text="Fichier(s) recepteur (.mol / .pdb)",
+        tk.Label(docking_panel, text="Fichier(s) recepteur (.mol / .pdb)",
                  font=FONT_SMALL, bg=COLORS["bg"],
                  fg=COLORS["text"]).pack(anchor="w", pady=(4, 0))
-        r_recep = tk.Frame(f, bg=COLORS["bg"]); r_recep.pack(fill="x", pady=2)
+        r_recep = tk.Frame(docking_panel, bg=COLORS["bg"]); r_recep.pack(fill="x", pady=2)
         self.lb_receptors = tk.Listbox(r_recep, height=4,
                                        bg=COLORS["card"], fg=COLORS["text"],
                                        selectbackground=COLORS["accent"],
@@ -898,30 +1297,195 @@ class PipelineGUI(tk.Tk):
                   activebackground=COLORS["accent"],
                   relief="flat", command=self._remove_receptor).pack()
 
-        self.e_vina_exe = self._file_row(f, "Executable Vina",        self._browse_vina,
+        self.e_vina_exe = self._file_row(docking_panel, "Executable Vina", self._browse_vina,
                                           default=_default_vina)
-        r4 = tk.Frame(f, bg=COLORS["bg"]); r4.pack(fill="x", pady=2)
+        r4 = tk.Frame(docking_panel, bg=COLORS["bg"]); r4.pack(fill="x", pady=2)
         self.e_vina_exh     = ParamEntry(r4, "Exhaustivite", "34",   6)
         self.e_vina_exh.pack(side="left", padx=(0, 6))
         self.e_vina_poses   = ParamEntry(r4, "Nb poses",     "1000",  6)
         self.e_vina_poses.pack(side="left", padx=(0, 6))
         self.e_vina_scoring = ParamEntry(r4, "Scoring",      "vinardo", 8)
         self.e_vina_scoring.pack(side="left")
-
-        self._sep(f, "Modules (optionnel)")
-        self.e_psi4_file = self._file_row(
-            f, "psi4_calculator_fixed_y.py",
-            lambda: self._browse_py(self.e_psi4_file))
-        self.e_dens_file = self._file_row(
-            f, "electron_density_analysis_fixed.py",
-            lambda: self._browse_py(self.e_dens_file))
+        self.e_vina_runs = ParamEntry(
+            docking_panel, "Recherches globales indépendantes", "3", 8,
+            "Seeds Vina différentes; le peptide entier reste dans la boîte.",
+        )
+        self.e_vina_runs.pack(anchor="w", pady=2)
         self.e_dock_file = self._file_row(
-            f, "docking_kd_pipeline.py",
-            lambda: self._browse_py(self.e_dock_file))
+            docking_panel, "Module docking Vina",
+            lambda: self._browse_py(self.e_dock_file),
+        )
+
+        self._panel_order = ("geometry", "xtb", "dft", "tddft", "density", "docking")
+        if self.xtb_stop_after_var.get():
+            self._on_xtb_stop_after_toggle()
+        else:
+            self._refresh_step_panels()
 
         self._sep(f, "Dossier de sortie")
         self.e_outdir = self._file_row(f, "", self._browse_outdir,
                                        default=r"C:\Users\ugo.pasco\Documents\2A\Data finale MD\Quantumator\Results")
+
+    def _show_atom_index_preview(self):
+        batch_file = self.e_batch.get().strip()
+        batch_dir = Path(batch_file).resolve().parent if batch_file else None
+        if batch_file:
+            try:
+                molecules = _load_batch_file(batch_file)
+            except Exception as exc:
+                messagebox.showerror("Indices atomiques", str(exc))
+                return
+        else:
+            molecules = [(self.e_name.get() or "Molecule",
+                          self.e_smiles.get().strip(),
+                          self.e_xyz.get().strip())]
+
+        window = tk.Toplevel(self)
+        window.title("Structure et indices atomiques")
+        window.geometry("1450x850")
+        window.minsize(900, 600)
+
+        selector_frame = tk.Frame(window, bg=COLORS["bg"])
+        selector_frame.pack(fill="x", padx=8, pady=8)
+        tk.Label(selector_frame, text="Molecule", font=FONT_BOLD,
+                 bg=COLORS["bg"], fg=COLORS["text"]).pack(side="left", padx=(0, 8))
+        choices = [f"{name} | {smiles[:55]}" for name, smiles, _ in molecules]
+        selected = ttk.Combobox(selector_frame, values=choices,
+                                 state="readonly", width=78)
+        selected.pack(side="left", fill="x", expand=True)
+        selected.current(0)
+
+        body = tk.Frame(window, bg=COLORS["bg"])
+        body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        image_panel = tk.Frame(body, bg=COLORS["panel"])
+        image_panel.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        canvas = tk.Canvas(image_panel, bg="white", highlightthickness=0)
+        image_ybar = ttk.Scrollbar(image_panel, orient="vertical", command=canvas.yview)
+        image_xbar = ttk.Scrollbar(image_panel, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=image_ybar.set,
+                         xscrollcommand=image_xbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        image_ybar.grid(row=0, column=1, sticky="ns")
+        image_xbar.grid(row=1, column=0, sticky="ew")
+        image_panel.rowconfigure(0, weight=1)
+        image_panel.columnconfigure(0, weight=1)
+
+        table_panel = tk.Frame(body, bg=COLORS["panel"], width=410)
+        table_panel.pack(side="right", fill="y")
+        table_panel.pack_propagate(False)
+        tree = ttk.Treeview(table_panel, columns=("index", "atom", "neighbors"),
+                            show="headings", height=28)
+        tree.heading("index", text="Indice")
+        tree.heading("atom", text="Atome")
+        tree.heading("neighbors", text="Voisins (indice:atome)")
+        tree.column("index", width=58, anchor="center", stretch=False)
+        tree.column("atom", width=70, anchor="center", stretch=False)
+        tree.column("neighbors", width=255, anchor="w")
+        tree_ybar = ttk.Scrollbar(table_panel, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=tree_ybar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        tree_ybar.pack(side="right", fill="y")
+
+        def render_selected(_event=None):
+            molecule_index = selected.current()
+            if molecule_index < 0:
+                molecule_index = 0
+            name, smiles, xyz_file = molecules[molecule_index]
+            canvas.delete("all")
+            tree.delete(*tree.get_children())
+            window._atom_preview_image = None
+
+            if xyz_file:
+                xyz_path = Path(xyz_file)
+                if not xyz_path.is_absolute() and batch_dir:
+                    xyz_path = batch_dir / xyz_path
+                try:
+                    xyz_lines = [line for line in xyz_path.read_text(
+                        encoding="utf-8").splitlines() if line.strip()]
+                    atom_count = int(xyz_lines[0])
+                    atom_lines = xyz_lines[2:2 + atom_count]
+                    if len(atom_lines) != atom_count:
+                        raise ValueError("Fichier XYZ incomplet.")
+                    for index, atom_line in enumerate(atom_lines, 1):
+                        symbol = atom_line.split()[0]
+                        tree.insert("", "end", values=(index, symbol, ""))
+                    canvas.create_text(
+                        24, 24, anchor="nw", fill="#222222",
+                        font=FONT_NORMAL,
+                        text=(f"{name}\nIndices basés sur l'ordre des atomes "
+                              f"dans le fichier XYZ ({atom_count} atomes).\n\n"
+                              "Le XYZ ne contient pas de connectivité pour dessiner "
+                              "la molécule sans réattribuer les atomes."),
+                    )
+                    canvas.configure(scrollregion=canvas.bbox("all"))
+                except (OSError, ValueError, IndexError) as exc:
+                    canvas.create_text(24, 24, anchor="nw", fill="#a00000",
+                                       font=FONT_NORMAL,
+                                       text=f"Impossible de lire {xyz_path}: {exc}")
+                return
+
+            try:
+                png, width, height, atom_rows = _numbered_molecule_image(smiles)
+                import base64
+                image = tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
+                window._atom_preview_image = image
+                canvas.create_image(0, 0, image=image, anchor="nw")
+                canvas.configure(scrollregion=(0, 0, width, height))
+                for row in atom_rows:
+                    tree.insert("", "end", values=row)
+            except Exception as exc:
+                canvas.create_text(24, 24, anchor="nw", fill="#a00000",
+                                   font=FONT_NORMAL,
+                                   text=f"Impossible de dessiner {name}: {exc}")
+
+        selected.bind("<<ComboboxSelected>>", render_selected)
+        render_selected()
+
+    def _on_xtb_step_toggle(self):
+        xtb_selected = self._step_vars["xtb"].get()
+        self.xtb_stop_after_check.config(state="normal" if xtb_selected else "disabled")
+        if not xtb_selected and self.xtb_stop_after_var.get():
+            self.xtb_stop_after_var.set(False)
+            self._on_xtb_stop_after_toggle()
+        self._refresh_step_panels()
+
+    def _on_xtb_stop_after_toggle(self):
+        downstream = ("dft", "tddft", "density", "docking")
+        if self.xtb_stop_after_var.get():
+            if self._steps_before_xtb_stop is None:
+                self._steps_before_xtb_stop = {
+                    key: self._step_vars[key].get() for key in downstream
+                }
+            for key in downstream:
+                self._step_vars[key].set(False)
+                self._step_checkbuttons[key].config(state="disabled")
+        else:
+            if self._steps_before_xtb_stop is not None:
+                for key in downstream:
+                    self._step_vars[key].set(self._steps_before_xtb_stop[key])
+            self._steps_before_xtb_stop = None
+            for key in downstream:
+                self._step_checkbuttons[key].config(state="normal")
+        self._refresh_step_panels()
+
+    def _on_step_selection_changed(self):
+        self._refresh_step_panels()
+
+    def _refresh_step_panels(self):
+        selected = {key: variable.get() for key, variable in self._step_vars.items()}
+        visible = {
+            "geometry": selected["xtb"] or selected["dft"] or selected["docking"],
+            "xtb": selected["xtb"],
+            "dft": selected["dft"] and not self.xtb_stop_after_var.get(),
+            "tddft": selected["tddft"] and not self.xtb_stop_after_var.get(),
+            "density": selected["density"] and not self.xtb_stop_after_var.get(),
+            "docking": selected["docking"] and not self.xtb_stop_after_var.get(),
+        }
+        for panel in self._step_panels.values():
+            panel.pack_forget()
+        for key in self._panel_order:
+            if visible[key]:
+                self._step_panels[key].pack(fill="x", pady=2)
 
     def _build_right(self, parent):
         ind_f = tk.Frame(parent, bg=COLORS["panel"])
@@ -932,7 +1496,7 @@ class PipelineGUI(tk.Tk):
         row_ind = tk.Frame(ind_f, bg=COLORS["panel"])
         row_ind.pack(anchor="w", padx=8, pady=(0, 6))
         self._indicators: dict = {}
-        for key, lbl in [("init", "Init"), ("dft", "DFT"),
+        for key, lbl in [("init", "Init"), ("xtb", "xTB"), ("dft", "DFT"),
                          ("tddft", "TDDFT"), ("density", "Densite"),
                          ("docking", "Docking")]:
             ind = StepIndicator(row_ind, lbl)
@@ -1034,7 +1598,10 @@ class PipelineGUI(tk.Tk):
         self.r_lambda = cell("lambda max (nm)",  0, 1)
         self.r_fosc   = cell("Force osc.",       0, 2)
         self.r_dg     = cell("DeltaG kcal/mol",  0, 3)
+        self.r_dg.config(wraplength=190, justify="left")
         self.r_kd     = cell("Kd (M)",           0, 4)
+        self.r_xtb    = cell("Resume xTB",        1, 0)
+        self.r_xtb.config(wraplength=240, justify="left")
 
     # =========================================================================
     # Tick global unique
@@ -1089,7 +1656,7 @@ class PipelineGUI(tk.Tk):
             return
         for ind in self._indicators.values():
             ind.set_state("pending")
-        for w in [self.r_energy, self.r_lambda, self.r_fosc, self.r_dg, self.r_kd]:
+        for w in [self.r_energy, self.r_lambda, self.r_fosc, self.r_dg, self.r_kd, self.r_xtb]:
             w.config(text="—", fg=COLORS["text"])
 
         self.btn_run.config(state="disabled")
@@ -1098,10 +1665,35 @@ class PipelineGUI(tk.Tk):
         self.spinner.show()
         self.lbl_status.config(text="Calcul en cours...")
 
-        steps = ["dft"] + [k for k in ["tddft", "density", "docking"]
-                           if self._step_vars[k].get()]
+        steps = [k for k in ["xtb", "dft", "tddft", "density", "docking"]
+                 if self._step_vars[k].get()]
+        if self.xtb_stop_after_var.get():
+            steps = ["xtb"]
+        dihedrals = _parse_dihedrals(
+            self.xtb_dihedrals_text.get("1.0", "end")
+        )
         params = {
             "steps":              steps,
+            "xtb_exe":            self.e_xtb_exe.get() or "xtb",
+            "xtb_method":         self.e_xtb_method.get() or "GFN2",
+            "xtb_opt_level":      self.e_xtb_level.get() or "tight",
+            "xtb_charge":         self.e_xtb_charge.get() or "0",
+            "xtb_multiplicity":   self.e_xtb_mult.get() or "1",
+            "xtb_threads":        self.e_xtb_threads.get() or "10",
+            "run_crest":          self.crest_var.get(),
+            "crest_exe":          self.e_crest_exe.get() or "crest",
+            "crest_n_conformers": self.e_crest_n.get() or "10",
+            "crest_use_wsl":      self.crest_wsl_var.get(),
+            "crest_wsl_exe":      self.e_crest_wsl_exe.get() or "crest",
+            "crest_wsl_xtb_exe":  self.e_crest_wsl_xtb_exe.get() or (
+                "/home/ugopasco/miniforge3/envs/crest_xtb/bin/xtb"
+            ),
+            "xtb_dihedrals":      dihedrals,
+            "xtb_planarity_threshold_deg": self.e_xtb_threshold.get() or "5.0",
+            "xtb_run_constrained": self.xtb_constrain_var.get(),
+            "xtb_constraint_target_deg": self.e_xtb_target.get() or "0",
+            "xtb_constraint_force_constant": self.e_xtb_force.get() or "0.5",
+            "xtb_stop_after":    self.xtb_stop_after_var.get(),
             "smiles":             self.e_smiles.get(),
             "name":               self.e_name.get(),
             "output_dir":         self.e_outdir.get()       or "./pipeline_results",
@@ -1122,6 +1714,8 @@ class PipelineGUI(tk.Tk):
             "vina_exhaustiveness": self.e_vina_exh.get()    or "34",
             "vina_n_poses":       self.e_vina_poses.get()   or "1000",
             "vina_scoring":       self.e_vina_scoring.get() or "vinardo",
+            "vina_runs":          self.e_vina_runs.get()    or "3",
+            "vina_seed":          "42",
             "skip_single_point":  self.skip_sp_var.get(),
             "xyz_file":           self.e_xyz.get(),
             "batch_file":         self.e_batch.get(),
@@ -1215,6 +1809,53 @@ class PipelineGUI(tk.Tk):
     # =========================================================================
 
     def _validate(self) -> bool:
+        if not any(variable.get() for variable in self._step_vars.values()):
+            messagebox.showerror("Etapes", "Selectionnez au moins une etape du pipeline.")
+            return False
+        if (self._step_vars["xtb"].get()
+                and not self.xtb_stop_after_var.get()
+                and not self._step_vars["dft"].get()):
+            messagebox.showerror(
+                "Etapes",
+                "Avec xTB, activez DFT pour continuer ou cochez 'Arreter apres xTB'.",
+            )
+            return False
+        if (self._step_vars["tddft"].get() or self._step_vars["density"].get()) \
+                and not self._step_vars["dft"].get():
+            messagebox.showerror(
+                "Etapes", "TDDFT et densite electronique necessitent l'etape DFT."
+            )
+            return False
+        try:
+            if self._step_vars["xtb"].get():
+                if self.e_xtb_method.get().strip().upper() not in ("GFN1", "GFN2"):
+                    raise ValueError("La methode xTB doit etre GFN1 ou GFN2.")
+                if self.e_xtb_level.get().strip().lower() not in (
+                        "normal", "tight", "verytight"):
+                    raise ValueError("Le niveau xTB doit etre normal, tight ou verytight.")
+                int(self.e_xtb_charge.get())
+                if int(self.e_xtb_mult.get()) < 1 or int(self.e_xtb_threads.get()) < 1:
+                    raise ValueError("Multiplicite et threads doivent etre positifs.")
+                if int(self.e_crest_n.get()) < 1:
+                    raise ValueError("Le nombre de conformeres CREST doit etre positif.")
+                if float(self.e_xtb_threshold.get()) < 0:
+                    raise ValueError("Le seuil de planarite ne peut pas etre negatif.")
+            dihedral_indices = _parse_dihedrals(
+                self.xtb_dihedrals_text.get("1.0", "end")
+            )
+            if self.xtb_constrain_var.get():
+                if not self._step_vars["xtb"].get():
+                    raise ValueError("Activez l'etape xTB pour lancer le test contraint.")
+                if not dihedral_indices:
+                    raise ValueError("Entrez au moins un diedre a contraindre.")
+                target = float(self.e_xtb_target.get())
+                if min(abs(target), abs(180.0 - abs(target))) > 1e-6:
+                    raise ValueError("Une cible plane doit etre 0 ou 180 degres.")
+                if float(self.e_xtb_force.get()) <= 0:
+                    raise ValueError("La constante de force doit etre positive.")
+        except ValueError as exc:
+            messagebox.showerror("Parametres xTB", str(exc))
+            return False
         batch_file = self.e_batch.get()
         if batch_file:
             # Mode batch : verifier que le fichier existe
@@ -1244,6 +1885,14 @@ class PipelineGUI(tk.Tk):
                 messagebox.showerror("Docking",
                                      "Chemin de l'executable Vina requis.")
                 return False
+            try:
+                if int(self.e_vina_runs.get()) < 1:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror(
+                    "Docking", "Le nombre de recherches globales doit etre un entier positif."
+                )
+                return False
             scoring = (self.e_vina_scoring.get() or "vina").strip().lower()
             if scoring not in ("vina", "vinardo"):
                 messagebox.showerror(
@@ -1261,6 +1910,7 @@ class PipelineGUI(tk.Tk):
         dft   = results.get("dft",     {})
         tddft = results.get("tddft",   {})
         dock  = results.get("docking", {})
+        xtb   = results.get("xtb",     {})
         e = dft.get("energy_hartree")
         self.r_energy.config(
             text=f"{e:.8f}" if isinstance(e, float) else "—",
@@ -1273,13 +1923,64 @@ class PipelineGUI(tk.Tk):
         self.r_fosc.config(
             text=f"{fosc:.4f}" if isinstance(fosc, float) else "—")
         dg = dock.get("best_dG_kcalmol")
+        ensemble = results.get("docking_ensemble", {})
+        if ensemble and ensemble.get("mean_best_dG_kcalmol") is not None:
+            dg_text = (
+                f"Best {dg:.2f}" if isinstance(dg, (int, float)) else "Best —"
+            )
+            dg_text += (
+                f" | Ens {ensemble['mean_best_dG_kcalmol']:.2f} "
+                f"± {ensemble['std_best_dG_kcalmol']:.2f} "
+                f"({ensemble['successful_models']}/{ensemble['receptor_models']})"
+            )
+        else:
+            dg_text = f"{dg:.2f}" if isinstance(dg, (int, float)) else "—"
         self.r_dg.config(
-            text=f"{dg:.2f}" if isinstance(dg, float) else "—",
+            text=dg_text,
             fg=COLORS["success"] if isinstance(dg, float) and dg < -4
                else COLORS["warning"] if isinstance(dg, float)
                else COLORS["text_dim"])
         kd = dock.get("best_Kd_M")
         self.r_kd.config(text=f"{kd:.2e}" if isinstance(kd, float) else "—")
+        if xtb:
+            energy = xtb.get("energy_hartree")
+            parts = ["OK" if xtb.get("converged") else "NON CONVERGE"]
+            if energy is not None:
+                parts.append(f"{energy:.6f} Ha")
+            if xtb.get("n_iterations") is not None:
+                parts.append(f"{xtb['n_iterations']} iter")
+            if xtb.get("time_s") is not None:
+                parts.append(f"{xtb['time_s']:.1f} s")
+            dihedral = xtb.get("dihedrals", {}).get("dihedral_1")
+            if dihedral:
+                parts.append(f"D1 {dihedral['dihedral_deg']:.1f} deg")
+            if xtb.get("planarity") is not None:
+                parts.append("PLANAIRE" if xtb["planarity"] else "NON PLANAIRE")
+            summary_text = " | ".join(parts)
+            constrained = xtb.get("constrained", {})
+            if constrained:
+                if constrained.get("success"):
+                    constrained_energy = constrained.get("energy_hartree")
+                    delta_energy = constrained.get("energy_difference_hartree")
+                    constrained_status = "Contrainte OK"
+                    constrained_planarity = constrained.get("planarity", {}).get("all_planar")
+                    if constrained_planarity is not None:
+                        constrained_status += (
+                            " | PLANAIRE" if constrained_planarity else " | NON PLANAIRE"
+                        )
+                    if constrained_energy is not None:
+                        constrained_status += f" | E {constrained_energy:.6f} Ha"
+                    if delta_energy is not None:
+                        constrained_status += f" | dE {delta_energy:+.6f} Ha"
+                    summary_text += "\n" + constrained_status
+                else:
+                    summary_text += f"\nContrainte echec: {constrained.get('error', '?')}"
+            self.r_xtb.config(
+                text=summary_text,
+                fg=COLORS["success"] if xtb.get("success") else COLORS["error"],
+            )
+        else:
+            self.r_xtb.config(text="—", fg=COLORS["text_dim"])
 
     def _clear_log(self):
         self.log_box.config(state="normal")
@@ -1344,6 +2045,18 @@ class PipelineGUI(tk.Tk):
             title="Executable Vina",
             filetypes=[("Executables", "*.exe"), ("All", "*.*")])
         if p: self.e_vina_exe.set(p)
+
+    def _browse_xtb(self):
+        p = filedialog.askopenfilename(
+            title="Executable xTB",
+            filetypes=[("Executables", "*.exe"), ("All", "*.*")])
+        if p: self.e_xtb_exe.set(p)
+
+    def _browse_crest(self):
+        p = filedialog.askopenfilename(
+            title="Executable CREST",
+            filetypes=[("Executables", "*.exe"), ("All", "*.*")])
+        if p: self.e_crest_exe.set(p)
 
     def _browse_py(self, entry):
         p = filedialog.askopenfilename(
