@@ -35,8 +35,6 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 
-import psi4
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Import dynamique des trois modules
 # ─────────────────────────────────────────────────────────────────────────────
@@ -46,6 +44,7 @@ _DEFAULT_DIR = Path(__file__).parent
 _PSI4_CALC_FILE  = _DEFAULT_DIR / "psi4_calculator_fixed_y.py"
 _ELEC_DENS_FILE  = _DEFAULT_DIR / "electron_density_analysis_fixed.py"
 _DOCKING_FILE    = _DEFAULT_DIR / "docking_kd_pipeline.py"
+_XTB_OPTIMIZER_FILE = _DEFAULT_DIR / "xtb_optimizer.py"
 
 
 def _validate_module_path(file_path: str) -> str:
@@ -66,7 +65,7 @@ def _validate_module_path(file_path: str) -> str:
     return str(resolved)
 
 
-from utils_paths import _sanitize_mol_name
+from utils_paths import OutputLayout, _sanitize_mol_name
 
 
 def _validate_vina_exe(exe: str) -> str:
@@ -144,10 +143,34 @@ class PipelineConfig:
         psi4_calc_file: Optional[str] = None,
         elec_dens_file: Optional[str] = None,
         docking_file: Optional[str] = None,
+        run_xtb: bool = False,
+        xtb_exe: str = "xtb",
+        xtb_method: str = "GFN2",
+        xtb_opt_level: str = "tight",
+        xtb_charge: int = 0,
+        xtb_multiplicity: int = 1,
+        xtb_threads: Optional[int] = None,
+        run_crest: bool = False,
+        crest_exe: str = "crest",
+        crest_n_conformers: int = 10,
+        crest_use_wsl: bool = False,
+        crest_wsl_exe: str = "crest",
+        crest_wsl_xtb_exe: str = "/home/ugopasco/miniforge3/envs/crest_xtb/bin/xtb",
+        xtb_use_optimized_geometry_for_dft: bool = True,
+        xtb_use_optimized_geometry_for_docking: bool = True,
+        xtb_dihedrals: Optional[List[List[int]]] = None,
+        xtb_planarity_threshold_deg: float = 5.0,
+        xtb_run_constrained: bool = False,
+        xtb_constraint_target_deg: float = 0.0,
+        xtb_constraint_force_constant: float = 0.5,
+        vina_runs: int = 3,
+        vina_seed: int = 42,
+        xtb_stop_after: bool = False,
     ):
         self.smiles = smiles
         self.name = _sanitize_mol_name(name)
         self.output_dir = Path(output_dir)
+        self.layout = OutputLayout(self.output_dir)
         self.dft_functional = dft_functional
         self.dft_basis = dft_basis
         self.memory = memory
@@ -174,6 +197,29 @@ class PipelineConfig:
         self.psi4_calc_file = Path(psi4_calc_file or _PSI4_CALC_FILE)
         self.elec_dens_file = Path(elec_dens_file or _ELEC_DENS_FILE)
         self.docking_file   = Path(docking_file   or _DOCKING_FILE)
+        self.run_xtb = run_xtb
+        self.xtb_exe = xtb_exe
+        self.xtb_method = xtb_method
+        self.xtb_opt_level = xtb_opt_level
+        self.xtb_charge = int(xtb_charge)
+        self.xtb_multiplicity = int(xtb_multiplicity)
+        self.xtb_threads = int(xtb_threads or threads)
+        self.run_crest = run_crest
+        self.crest_exe = crest_exe
+        self.crest_n_conformers = int(crest_n_conformers)
+        self.crest_use_wsl = crest_use_wsl
+        self.crest_wsl_exe = crest_wsl_exe
+        self.crest_wsl_xtb_exe = crest_wsl_xtb_exe
+        self.xtb_use_optimized_geometry_for_dft = xtb_use_optimized_geometry_for_dft
+        self.xtb_use_optimized_geometry_for_docking = xtb_use_optimized_geometry_for_docking
+        self.xtb_dihedrals = xtb_dihedrals or []
+        self.xtb_planarity_threshold_deg = float(xtb_planarity_threshold_deg)
+        self.xtb_run_constrained = xtb_run_constrained
+        self.xtb_constraint_target_deg = float(xtb_constraint_target_deg)
+        self.xtb_constraint_force_constant = float(xtb_constraint_force_constant)
+        self.vina_runs = max(1, int(vina_runs))
+        self.vina_seed = int(vina_seed)
+        self.xtb_stop_after = xtb_stop_after
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,7 +227,7 @@ class PipelineConfig:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MolecularPipeline:
-    AVAILABLE_STEPS = ["dft", "tddft", "density", "docking"]
+    AVAILABLE_STEPS = ["xtb", "dft", "tddft", "density", "docking"]
 
     def __init__(self, config: PipelineConfig):
         self.cfg = config
@@ -190,7 +236,7 @@ class MolecularPipeline:
         self._dft_atoms = None
         self._dft_coords = None
         self._log_lines: List[str] = []
-        self.cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        self.cfg.layout.create()
 
     # ── Logging ──────────────────────────────────────────────────────────────
 
@@ -211,6 +257,10 @@ class MolecularPipeline:
         self._psi4_mod    = None
         self._density_mod = None
         self._docking_mod = None
+        self._xtb_mod = None
+        if "xtb" in steps:
+            self._log("Chargement xtb_optimizer...")
+            self._xtb_mod = _load_module("xtb_optimizer", str(_XTB_OPTIMIZER_FILE))
         if any(s in steps for s in ["dft", "tddft"]):
             self._log("Chargement psi4_calculator...")
             self._psi4_mod = _load_module("psi4_calculator", str(self.cfg.psi4_calc_file))
@@ -222,24 +272,149 @@ class MolecularPipeline:
             self._docking_mod = _load_module("docking_kd_pipeline", str(self.cfg.docking_file))
 
     # =========================================================================
-    # ÉTAPE 1 : DFT (OBLIGATOIRE)
+    # Étape xTB : optimisation préalable facultative
+    # =========================================================================
+
+    def _prepare_initial_xyz(self) -> Path:
+        if self.xyz_path is not None and self.xyz_path.is_file():
+            return self.xyz_path
+        if self.cfg.xyz_file:
+            if not self.cfg.xyz_file.is_file():
+                raise FileNotFoundError(f"Fichier XYZ introuvable : {self.cfg.xyz_file}")
+            destination = self.cfg.layout.molecule_file(self.cfg.name, "geomUtilisateur_initiale", "xyz")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            import shutil
+            shutil.copy2(self.cfg.xyz_file, destination)
+            self.xyz_path = destination
+        else:
+            destination = self.cfg.layout.molecule_file(self.cfg.name, "geomRDKit_initiale", "xyz")
+            self.xyz_path = self._xtb_mod.XTBOptimizer.generate_xyz_from_smiles(
+                self.cfg.smiles, destination
+            )
+        return self.xyz_path
+
+    def _step_xtb(self) -> Dict:
+        t0 = time.time()
+        if self._xtb_mod is None:
+            raise RuntimeError("Module xtb_optimizer non chargé.")
+        initial_xyz = self._prepare_initial_xyz()
+        self._log(f"Géométrie initiale xTB : {initial_xyz}")
+        self._log(f"Méthode xTB : {self.cfg.xtb_method} | optimisation {self.cfg.xtb_opt_level}")
+        optimizer = self._xtb_mod.XTBOptimizer(
+            self.cfg.xtb_exe,
+            self.cfg.crest_exe,
+            crest_use_wsl=self.cfg.crest_use_wsl,
+            crest_wsl_exe=self.cfg.crest_wsl_exe,
+            crest_wsl_xtb_exe=self.cfg.crest_wsl_xtb_exe,
+        )
+        xtb_res = optimizer.optimize(
+            initial_xyz,
+            self.cfg.layout.geometries,
+            method=self.cfg.xtb_method,
+            opt_level=self.cfg.xtb_opt_level,
+            charge=self.cfg.xtb_charge,
+            multiplicity=self.cfg.xtb_multiplicity,
+            threads=self.cfg.xtb_threads,
+            run_crest=self.cfg.run_crest,
+            crest_n_conformers=self.cfg.crest_n_conformers,
+            scratch_dir=self.cfg.layout.temp / "xtb",
+            output_name=f"{self.cfg.name}_geomxTB_opti.xyz",
+            receptor_name=f"{self.cfg.name}_receptor_xTB.mol",
+            topology_smiles=self.cfg.smiles if self.cfg.xyz_file is None else None,
+        )
+        xtb_res.update({
+            "method": self.cfg.xtb_method,
+            "opt_level": self.cfg.xtb_opt_level,
+            "input_xyz": str(initial_xyz),
+            "time_s": xtb_res.get("runtime_s", round(time.time() - t0, 2)),
+        })
+        if xtb_res.get("success"):
+            self.xyz_path = Path(xtb_res["optimized_xyz"])
+            if self.cfg.xtb_dihedrals:
+                coords = optimizer._read_coordinates(self.xyz_path)
+                planarity = self._xtb_mod.analyze_dihedrals(
+                    coords, self.cfg.xtb_dihedrals,
+                    self.cfg.xtb_planarity_threshold_deg,
+                )
+                xtb_res["dihedrals"] = planarity
+                xtb_res["planarity"] = planarity.get("all_planar")
+            self._log(f"Géométrie xTB sauvegardée : {self.xyz_path}")
+            if xtb_res.get("receptor_mol"):
+                self._log(f"Récepteur MOL exporté pour Vina : {xtb_res['receptor_mol']}")
+            elif xtb_res.get("receptor_export_error"):
+                self._log(f"Export MOL récepteur impossible : {xtb_res['receptor_export_error']}")
+            if xtb_res.get("energy_hartree") is not None:
+                self._log(f"Énergie xTB : {xtb_res['energy_hartree']:.8f} Ha")
+            if self.cfg.xtb_run_constrained:
+                if not self.cfg.xtb_dihedrals:
+                    xtb_res["constrained"] = {
+                        "success": False,
+                        "error": "Entrez au moins un dièdre pour l'optimisation contrainte.",
+                    }
+                else:
+                    constrained = optimizer.optimize_constrained_dihedrals(
+                        self.xyz_path,
+                        self.cfg.layout.geometries,
+                        self.cfg.xtb_dihedrals,
+                        target_deg=self.cfg.xtb_constraint_target_deg,
+                        method=self.cfg.xtb_method,
+                        opt_level=self.cfg.xtb_opt_level,
+                        charge=self.cfg.xtb_charge,
+                        multiplicity=self.cfg.xtb_multiplicity,
+                        threads=self.cfg.xtb_threads,
+                        force_constant=self.cfg.xtb_constraint_force_constant,
+                        scratch_dir=self.cfg.layout.temp / "xtb_constrained",
+                        output_name=f"{self.cfg.name}_geomxTB_contrainte.xyz",
+                        receptor_name=f"{self.cfg.name}_receptor_xTB_contrainte.mol",
+                        topology_smiles=self.cfg.smiles if self.cfg.xyz_file is None else None,
+                    )
+                    if constrained.get("success"):
+                        constrained["planarity"] = self._xtb_mod.analyze_dihedrals(
+                            optimizer._read_coordinates(constrained["optimized_xyz"]),
+                            self.cfg.xtb_dihedrals,
+                            self.cfg.xtb_planarity_threshold_deg,
+                        )
+                        constrained["energy_difference_hartree"] = (
+                            constrained["energy_hartree"] - xtb_res["energy_hartree"]
+                            if constrained.get("energy_hartree") is not None
+                            and xtb_res.get("energy_hartree") is not None
+                            else None
+                        )
+                    xtb_res["constrained"] = constrained
+                    if constrained.get("success"):
+                        self._log("Optimisation contrainte conservée séparément.")
+                        self._log(
+                            f"Écart d'énergie (contrainte - libre) : "
+                            f"{constrained.get('energy_difference_hartree')} Ha"
+                        )
+                    else:
+                        self._log(
+                            f"Optimisation contrainte échouée : {constrained.get('error')}"
+                        )
+        else:
+            self._log(f"Échec xTB : {xtb_res.get('error') or 'convergence non confirmée'}")
+        self.results["xtb"] = xtb_res
+        if not xtb_res.get("success"):
+            raise RuntimeError(xtb_res.get("error") or "Optimisation xTB non convergée.")
+        return xtb_res
+
+    # =========================================================================
+    # ÉTAPE DFT (OBLIGATOIRE uniquement pour le pipeline historique)
     # =========================================================================
 
     def _step_dft(self) -> Dict:
         t0 = time.time()
         import psi4
         psi4.core.clean_options()
-        
-        calc = self._psi4_mod.Psi4MolecularCalculator(
-            memory=self.cfg.memory,
-            threads=self.cfg.threads,
-        )
         if self._psi4_mod is None:
             raise RuntimeError("Module psi4_calculator non chargé.")
 
         calc = self._psi4_mod.Psi4MolecularCalculator(
             memory=self.cfg.memory,
             threads=self.cfg.threads,
+            work_dir=self.cfg.layout.temp / "psi4",
+            data_dir=self.cfg.layout.tddft,
+            log_prefix=self.cfg.name,
         )
 
         self._log(f"Molécule   : {self.cfg.name}")
@@ -247,12 +422,18 @@ class MolecularPipeline:
         self._log(f"Méthode    : {self.cfg.dft_functional}/{self.cfg.dft_basis}")
 
         # --- Bypass : utiliser un fichier XYZ pré-existant ---
+        xtb_dft_path = None
+        xtb_result = self.results.get("xtb", {})
+        if (xtb_result.get("success")
+                and self.cfg.xtb_use_optimized_geometry_for_dft):
+            xtb_dft_path = Path(xtb_result["optimized_xyz"])
+
         if self.cfg.xyz_file and not self.cfg.xyz_file.exists():
             raise FileNotFoundError(
                 f"Fichier XYZ introuvable : {self.cfg.xyz_file}\n"
                 f"Vérifiez le chemin dans votre fichier batch (colonne 3)."
             )
-        if self.cfg.xyz_file and self.cfg.xyz_file.exists():
+        if self.cfg.xyz_file and self.cfg.xyz_file.exists() and xtb_dft_path is None:
             self._log(f"XYZ BYPASS : {self.cfg.xyz_file}")
             self._log("Optimisation géométrique sautée — géométrie chargée depuis le fichier XYZ.")
 
@@ -300,7 +481,10 @@ class MolecularPipeline:
                     sp_energy = None
 
             # Copier le XYZ dans le dossier de sortie
-            self.xyz_path = self.cfg.output_dir / f"{self.cfg.name}.xyz"
+            self.xyz_path = self.cfg.layout.molecule_file(
+                self.cfg.name, "geomUtilisateur_initiale", "xyz"
+            )
+            self.xyz_path.parent.mkdir(parents=True, exist_ok=True)
             import shutil
             shutil.copy2(str(self.cfg.xyz_file), str(self.xyz_path))
 
@@ -328,9 +512,22 @@ class MolecularPipeline:
 
         # --- Mode normal : optimisation DFT complète ---
         # Créer la molécule Psi4
-        mol_psi4, xyz_file_used, xyz_content = calc.setup_molecule(
-            self.cfg.smiles, self.cfg.name
-        )
+        if xtb_dft_path is not None:
+            xyz_lines = [line for line in xtb_dft_path.read_text(encoding="utf-8").splitlines()
+                         if line.strip()]
+            atom_count = int(xyz_lines[0])
+            geometry_lines = xyz_lines[2:2 + atom_count]
+            mol_input = (f"{self.cfg.xtb_charge} {self.cfg.xtb_multiplicity}\n"
+                         + "\n".join(geometry_lines)
+                         + "\nunits angstrom\nno_reorient\nno_com\nsymmetry c1\n")
+            mol_psi4 = psi4.geometry(mol_input)
+            xyz_file_used = True
+            xyz_content = xtb_dft_path.read_text(encoding="utf-8")
+            self._log(f"Géométrie initiale DFT issue de xTB : {xtb_dft_path}")
+        else:
+            mol_psi4, xyz_file_used, xyz_content = calc.setup_molecule(
+                self.cfg.smiles, self.cfg.name
+            )
 
         # FIX : Forcer C1 + orientation fixe pour éviter "Point group changed!"
         try:
@@ -368,7 +565,10 @@ class MolecularPipeline:
             z = mol_psi4.z(i) * BOHR_TO_ANG
             xyz_lines.append(f"{sym:4s}  {x:12.8f}  {y:12.8f}  {z:12.8f}")
 
-        self.xyz_path = self.cfg.output_dir / f"{self.cfg.name}.xyz"
+        self.xyz_path = self.cfg.layout.molecule_file(
+            self.cfg.name, "geomDFT_opti", "xyz"
+        )
+        self.xyz_path.parent.mkdir(parents=True, exist_ok=True)
         self.xyz_path.write_text("\n".join(xyz_lines), encoding="utf-8")
         self._log(f"Géométrie sauvegardée : {self.xyz_path}")
 
@@ -406,6 +606,7 @@ class MolecularPipeline:
 
     def _step_tddft(self) -> Dict:
         t0 = time.time()
+        self.cfg.layout.tddft.mkdir(parents=True, exist_ok=True)
         import psi4
         psi4.core.clean_options()
 
@@ -415,6 +616,9 @@ class MolecularPipeline:
         calc = self._psi4_mod.Psi4MolecularCalculator(
             memory=self.cfg.memory,
             threads=self.cfg.threads,
+            work_dir=self.cfg.layout.temp / "psi4",
+            data_dir=self.cfg.layout.tddft,
+            log_prefix=self.cfg.name,
         )
 
         self._log(f"Solvant            : {self.cfg.tddft_solvent or 'phase gazeuse'}")
@@ -446,7 +650,9 @@ class MolecularPipeline:
                 # Copier le XYZ dans le dossier de sortie si pas encore fait
                 if self.xyz_path is None:
                     import shutil
-                    self.xyz_path = self.cfg.output_dir / f"{self.cfg.name}.xyz"
+                    self.xyz_path = self.cfg.layout.molecule_file(
+                        self.cfg.name, "geomUtilisateur_initiale", "xyz"
+                    )
                     shutil.copy2(str(self.cfg.xyz_file), str(self.xyz_path))
             except Exception as _e:
                 self._log(f"AVERT : impossible de charger le fichier XYZ ({_e}) — reconstruction depuis SMILES")
@@ -492,7 +698,8 @@ class MolecularPipeline:
 
         self._log(f"Temps TDDFT : {elapsed:.1f} s")
 
-        trans_file = self.cfg.output_dir / f"{self.cfg.name}_tddft_transitions.json"
+        trans_file = self.cfg.layout.tddft / f"{self.cfg.name}_tddft_transitions.json"
+        trans_file.parent.mkdir(parents=True, exist_ok=True)
         with open(trans_file, "w", encoding="utf-8") as fh:
             json.dump(tddft_res["all_transitions"], fh, indent=2, default=str)
 
@@ -517,7 +724,7 @@ class MolecularPipeline:
         self._log(f"Fonctionnelle densité : {self.cfg.density_functional}")
         self._log(f"Base densité          : {self.cfg.density_basis}")
 
-        mol_out_dir = self.cfg.output_dir / "density"
+        mol_out_dir = self.cfg.layout.density
         mol_out_dir.mkdir(parents=True, exist_ok=True)
 
         if self.xyz_path is None or not self.xyz_path.exists():
@@ -593,7 +800,7 @@ class MolecularPipeline:
         if not os.path.isfile(self.cfg.peptide_mol_file):
             raise FileNotFoundError(f"Fichier peptide introuvable : {self.cfg.peptide_mol_file}")
 
-        dock_out = self.cfg.output_dir / "binding"
+        dock_out = self.cfg.layout.binding
         dock_out.mkdir(parents=True, exist_ok=True)
 
         dock.VINA_EXE            = self.cfg.vina_exe
@@ -601,24 +808,36 @@ class MolecularPipeline:
         dock.VINA_N_POSES        = self.cfg.vina_n_poses
         dock.VINA_SCORING        = self.cfg.vina_scoring
         dock.VINA_N_POSES_EXPORT = min(5, self.cfg.vina_n_poses)
+        dock.VINA_N_RUNS         = self.cfg.vina_runs
+        dock.VINA_RANDOM_SEED    = self.cfg.vina_seed
 
         self._log("Préparation récepteur...")
         receptor_file, center, size, receptor_mol = dock.prepare_receptor(
             self.cfg.peptide_mol_file, str(dock_out),
-            box_override=self.cfg.box_override
+            box_override=self.cfg.box_override,
+            work_dir=self.cfg.layout.temp / "binding",
+            molecule_name=self.cfg.name,
         )
 
-        if self.xyz_path is None or not self.xyz_path.exists():
+        docking_xyz = self.xyz_path
+        xtb_result = self.results.get("xtb", {})
+        if (self.cfg.xtb_use_optimized_geometry_for_docking
+                and xtb_result.get("success")):
+            docking_xyz = Path(xtb_result["optimized_xyz"])
+        elif (xtb_result.get("success") and "dft" not in self.results
+              and xtb_result.get("input_xyz")):
+            docking_xyz = Path(xtb_result["input_xyz"])
+        if docking_xyz is None or not docking_xyz.exists():
             raise FileNotFoundError("XYZ ligand introuvable — étape DFT requise.")
 
         print("\n" + "=" * 60)
         print("ÉTAPE 2/4 — Préparation du ligand")
         print("=" * 60)
         print(f"  Ligand     : {self.cfg.name}")
-        print(f"  Source XYZ : {self.xyz_path}")
+        print(f"  Source XYZ : {docking_xyz}")
 
 
-        lig_mol = dock.read_xyz_to_mol(str(self.xyz_path))
+        lig_mol = dock.read_xyz_to_mol(str(docking_xyz))
 
         if lig_mol is None:
             raise RuntimeError("Échec lecture XYZ ligand.")
@@ -626,7 +845,7 @@ class MolecularPipeline:
         # Copier le XYZ du ligand dans le dossier docking (seul export)
         import shutil
         ligand_xyz_dst = dock_out / f"{self.cfg.name}.xyz"
-        shutil.copy2(str(self.xyz_path), str(ligand_xyz_dst))
+        shutil.copy2(str(docking_xyz), str(ligand_xyz_dst))
         self._log(f"XYZ ligand : {ligand_xyz_dst}")
 
         # PDBQT interne pour Vina
@@ -643,9 +862,22 @@ class MolecularPipeline:
             center,
             size,
             str(dock_out),
+            work_dir=self.cfg.layout.temp / "binding",
+            checkpoint_dir=self.cfg.layout.checkpoints / "binding",
+            log_dir=self.cfg.layout.logs / "binding",
         )
 
-        df = dock.analyze_results(results_raw, str(dock_out))
+        pi_contact_geometry = dock.analyze_pi_contacts(
+            receptor_mol, dock_out / "poses", self.cfg.name
+        )
+        self._log(
+            "Géométrie aromatique des poses : "
+            f"{pi_contact_geometry['pi_geometry_candidates']} candidate(s) π–π/edge-face "
+            f"sur {pi_contact_geometry['poses_analyzed']} pose(s); "
+            f"détails : {pi_contact_geometry['details_csv']}"
+        )
+
+        df = dock.analyze_results(results_raw, str(dock_out), name=self.cfg.name)
 
         elapsed = time.time() - t0
 
@@ -669,6 +901,8 @@ class MolecularPipeline:
             n_poses_col = next((c for c in df.columns
                                 if "n_poses" in c.lower()), None)
             n_poses_val = int(best[n_poses_col]) if n_poses_col else None
+            csv_path = dock_out / f"{self.cfg.name}_docking_results.csv"
+            plot_path = dock_out / f"{self.cfg.name}_docking_results.png"
 
             docking_res = {
                 "success":         True,
@@ -676,8 +910,13 @@ class MolecularPipeline:
                 "best_Kd_M":       best_kd,
                 "best_pKd":        best_pkd,
                 "n_poses":         n_poses_val,
-                "csv_file":        str(dock_out / "docking_results.csv"),
-                "plot_file":       str(dock_out / "docking_results.png"),
+                "n_runs":          int(best.get("n_runs", 1)),
+                "best_seed":       int(best.get("best_seed", self.cfg.vina_seed)),
+                "mean_best_dG_kcalmol": best.get("mean_best_dG_kcal_mol"),
+                "std_best_dG_kcalmol":  best.get("std_best_dG_kcal_mol"),
+                "pi_contact_geometry": pi_contact_geometry,
+                "csv_file":        str(csv_path),
+                "plot_file":       str(plot_path),
                 "poses_dir":       str(dock_out / "poses"),
                 "time_s":          round(elapsed, 2),
                 "df_columns":      list(df.columns),
@@ -685,8 +924,8 @@ class MolecularPipeline:
             if best_dg  is not None: self._log(f"DeltaG (meilleure pose) : {best_dg:.2f} kcal/mol")
             if best_kd  is not None: self._log(f"Kd estimé               : {best_kd:.2e} M")
             if best_pkd is not None: self._log(f"pKd                     : {best_pkd:.2f}")
-            self._log(f"CSV résultats : {dock_out / 'docking_results.csv'}")
-            self._log(f"Graphique     : {dock_out / 'docking_results.png'}")
+            self._log(f"CSV résultats : {csv_path}")
+            self._log(f"Graphique     : {plot_path}")
             self._log(f"Poses SDF     : {dock_out / 'poses'}")
             if n_poses_val is not None:
                 self._log(f"Poses trouvées : {n_poses_val}")
@@ -715,12 +954,14 @@ class MolecularPipeline:
                            for k, v in self.results.items()},
         }
 
-        json_path = self.cfg.output_dir / f"{self.cfg.name}_report.json"
+        json_path = self.cfg.layout.reports / f"{self.cfg.name}_report.json"
+        json_path.parent.mkdir(parents=True, exist_ok=True)
         with open(json_path, "w", encoding="utf-8") as fh:
             json.dump(report, fh, indent=2, default=str)
 
         # ── TXT (résumé lisible) ──
-        txt_path = self.cfg.output_dir / f"{self.cfg.name}_properties.txt"
+        txt_path = self.cfg.layout.reports / f"{self.cfg.name}_properties.txt"
+        txt_path.parent.mkdir(parents=True, exist_ok=True)
         W = 70
         lines = [
             "=" * W,
@@ -731,6 +972,47 @@ class MolecularPipeline:
             f"  Étapes réalisées : {', '.join(steps_done)}",
             "=" * W,
         ]
+
+        # ── xTB ──
+        xtb = self.results.get("xtb", {})
+        if xtb:
+            lines += ["", "─" * W, "  xTB — Optimisation géométrique", "─" * W]
+            lines.append(f"  Méthode            : {xtb.get('method', '?')}")
+            lines.append(f"  Niveau             : {xtb.get('opt_level', '?')}")
+            lines.append(f"  Convergence        : {'OUI' if xtb.get('converged') else 'NON'}")
+            energy = xtb.get("energy_hartree")
+            if energy is not None:
+                lines.append(f"  Énergie (Hartree)  : {energy:.10f}")
+            lines.append(f"  Itérations         : {xtb.get('n_iterations', '?')}")
+            lines.append(f"  Temps              : {xtb.get('time_s', '?')} s")
+            lines.append(f"  Géométrie          : {xtb.get('optimized_xyz') or '?'}")
+            if xtb.get("receptor_mol"):
+                lines.append(f"  Récepteur MOL      : {xtb['receptor_mol']}")
+            for key, dihedral in xtb.get("dihedrals", {}).items():
+                if key.startswith("dihedral_"):
+                    lines.append(
+                        f"  {key:<18} : {dihedral.get('dihedral_deg', 0.0):.1f}°"
+                    )
+            if "planarity" in xtb:
+                lines.append(f"  Système planaire   : {'OUI' if xtb['planarity'] else 'NON'}")
+            constrained = xtb.get("constrained", {})
+            if constrained:
+                lines += ["", "  Test contraint (géométrie séparée) :"]
+                lines.append(f"  Convergence        : {'OUI' if constrained.get('success') else 'NON'}")
+                constrained_energy = constrained.get("energy_hartree")
+                if constrained_energy is not None:
+                    lines.append(f"  Énergie (Hartree)  : {constrained_energy:.10f}")
+                energy_difference = constrained.get("energy_difference_hartree")
+                if energy_difference is not None:
+                    lines.append(f"  Delta E (Ha)       : {energy_difference:+.10f}")
+                lines.append(f"  Géométrie          : {constrained.get('optimized_xyz') or '?'}")
+                if constrained.get("receptor_mol"):
+                    lines.append(f"  Récepteur MOL      : {constrained['receptor_mol']}")
+                planarity = constrained.get("planarity", {})
+                if "all_planar" in planarity:
+                    lines.append(
+                        f"  Système planaire   : {'OUI' if planarity['all_planar'] else 'NON'}"
+                    )
 
         # ── DFT ──
         dft = self.results.get("dft", {})
@@ -868,17 +1150,31 @@ class MolecularPipeline:
 
     def run(self, steps: Optional[List[str]] = None) -> Dict:
         if steps is None:
-            steps = ["dft"]
-            if self.cfg.run_tddft:   steps.append("tddft")
-            if self.cfg.run_density: steps.append("density")
-            if self.cfg.run_docking: steps.append("docking")
+            steps = ["xtb"] if self.cfg.run_xtb else []
+            if not (self.cfg.run_xtb and self.cfg.xtb_stop_after):
+                steps.append("dft")
+                if self.cfg.run_tddft:   steps.append("tddft")
+                if self.cfg.run_density: steps.append("density")
+                if self.cfg.run_docking: steps.append("docking")
 
         steps = [s.lower().strip() for s in steps]
         unknown = set(steps) - set(self.AVAILABLE_STEPS)
         if unknown:
             raise ValueError(f"Étapes inconnues : {unknown}")
 
-        if "dft" not in steps:
+        if "xtb" in steps:
+            if self.cfg.xtb_stop_after:
+                skipped_steps = [step for step in steps if step != "xtb"]
+                if skipped_steps:
+                    self._log(
+                        "Arrêt demandé après xTB; étapes ignorées : "
+                        + ", ".join(skipped_steps)
+                    )
+                steps = ["xtb"]
+            elif "dft" not in steps:
+                steps.append("dft")
+
+        if "dft" not in steps and "xtb" not in steps:
             steps = ["dft"] + steps
         steps = sorted(steps, key=lambda s: self.AVAILABLE_STEPS.index(s))
 
@@ -891,6 +1187,7 @@ class MolecularPipeline:
         t_total = time.time()
 
         _step_labels = {
+            "xtb":     "ÉTAPE 1 - Optimisation xTB",
             "dft":     "ÉTAPE 1 - Optimisation DFT",
             "tddft":   "ÉTAPE 2 - Calcul TDDFT (lambda max / UV-Vis)",
             "density": "ÉTAPE 3 - Analyse densité électronique",
@@ -900,7 +1197,8 @@ class MolecularPipeline:
         try:
             for step in steps:
                 self._section(_step_labels.get(step, step.upper()))   # ← ICI dans run()
-                if step == "dft": self._step_dft()
+                if step == "xtb": self._step_xtb()
+                elif step == "dft": self._step_dft()
                 elif step == "tddft": self._step_tddft()
                 elif step == "density": self._step_density()
                 elif step == "docking": self._step_docking()
